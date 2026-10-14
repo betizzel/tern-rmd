@@ -524,17 +524,16 @@ local function insert_result(b: Buf, s: string, group: string?): KeyResult
 end
 
 -- The undo group a typed character joins: one character continues the group the
--- previous one opened unless it starts a new word, i.e. unless the character
--- before the caret is whitespace. A longer insert, and one that replaces a
--- selection, always opens its own step. The start of the text is not whitespace,
--- so the first character typed into a buffer opens exactly one group, which the
--- characters after it join.
+-- previous one opened, unless it starts a new word (the character before the
+-- caret is whitespace): then it closes that group and opens a fresh one, which
+-- the rest of the word joins, so undo takes back a word at a time. A longer
+-- insert, and one that replaces a selection, always opens its own step.
 local function insert_group(b: Buf, s: string): string?
 	if not is_single_char(s) or sel(b) ~= nil then
 		return nil
 	end
 	if b.cursor > 0 and is_space(cp_before(b.text, b.cursor)) then
-		return nil
+		close_group(b)
 	end
 	return "insert"
 end
@@ -670,7 +669,8 @@ local function enter_key(b: Buf, indent: number): KeyResult
 	local ls = line_start_at(text, c)
 	local le = line_end_at(text, ls)
 	local lead_end = ls
-	while lead_end < le and is_indent_cp(cp_at(text, lead_end)) do
+	-- only the indentation before the caret: what follows it keeps its own
+	while lead_end < math.min(le, c) and is_indent_cp(cp_at(text, lead_end)) do
 		lead_end = next_char(text, lead_end)
 	end
 	local lead = text:sub(ls + 1, lead_end)
@@ -735,7 +735,7 @@ local function tab_key(b: Buf, indent: number, shift: boolean): KeyResult
 	return HANDLED_CHANGED
 end
 
-local function backspace_key(b: Buf, indent: number): KeyResult
+local function backspace_key(b: Buf, indent: number, autopair: boolean): KeyResult
 	local text = b.text
 	local c = b.cursor
 	local s, e = sel(b)
@@ -774,10 +774,10 @@ local function backspace_key(b: Buf, indent: number): KeyResult
 		end_edit(b)
 		return HANDLED_CHANGED
 	end
-	-- between the two halves of an empty pair: take both
+	-- between the two halves of an empty pair the buffer typed: take both
 	local before = cp_before(text, c)
 	local after = cp_at(text, c)
-	if is_pair(before, after) then
+	if autopair and is_pair(before, after) then
 		begin_edit(b, "backspace")
 		splice(b, c - #before, c + #after, "")
 		b.cursor = c - #before
@@ -1155,22 +1155,32 @@ function M.line_count(text: string): number
 end
 
 -- UTF-16 code units in text:sub(1, byte); a character above U+FFFF counts 2.
+-- The view asks for the caret's and the anchor's offsets on every render, so
+-- valid UTF-8 is counted with the native utf8.len and string.find.
 function M.utf16(text: string, byte: number): number
 	if byte > #text then
 		byte = #text
 	end
-	local n = 0
+	local head = string.sub(text, 1, byte)
+	local n = utf8.len(head)
+	if n ~= nil then
+		-- each 4-byte character (lead byte F0-F4) takes a second unit
+		local i = string.find(head, "[\240-\244]")
+		while i do
+			n += 1
+			i = string.find(head, "[\240-\244]", i + 4)
+		end
+		return n
+	end
+	-- invalid UTF-8: walk it the way the caret moves
+	local units = 0
 	local i = 0
 	while i < byte do
 		local j = next_char(text, i)
-		if j - i == 4 then
-			n += 2
-		else
-			n += 1
-		end
+		units += if j - i == 4 then 2 else 1
 		i = j
 	end
-	return n
+	return units
 end
 
 -- Step back through the edit history; false when there is nothing to undo.
@@ -1289,7 +1299,7 @@ function M.key(b: Buf, key: Key, opts: Opts?): KeyResult
 	elseif name == "tab" then
 		return tab_key(b, indent, shift)
 	elseif name == "backspace" then
-		return backspace_key(b, indent)
+		return backspace_key(b, indent, autopair)
 	elseif name == "delete" then
 		return delete_key(b)
 	elseif name == "left" then

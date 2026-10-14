@@ -93,4 +93,28 @@ check("code to markdown", rmd.serialize(conv) == "Some *text*\n")
 rmd.convert(conv, conv.cells[1], "code")
 check("markdown to code", rmd.serialize(conv) == "```{r}\nSome *text*\n```\n")
 
+-- Chunks as knitr finds them, and their code as knitr runs it
+local function code_of(text: string): string
+	local out = {}
+	for _, cell in rmd.parse(text).cells do
+		if cell.kind == "code" then
+			table.insert(out, rmd.code(cell))
+		end
+	end
+	return table.concat(out, " | ")
+end
+local function code_is(name: string, text: string, want: string)
+	local got = code_of(text)
+	check(name, got == want, string.format("%q", got))
+end
+code_is("a four-backtick chunk may hold a ``` line", "T\n````{r}\n```\nx\n````\n", "```\nx")
+code_is("a chunk closes only at its own fence", "T\n```{r}\n1\n````\n2\n```\n", "1\n````\n2")
+code_is("a new opener ends an unclosed chunk", "T\n```{r}\nx\n```{r}\ny\n```\n", "y")
+code_is("the engine ends at a space or comma", "T\n```{r-foo}\n1\n```\n", "")
+code_is("braces inside the options", "T\n```{r, fig.cap='}'}\n1\n```\n", "1")
+code_is("blockquote prefix comes off the code", "> ```{r}\n> x <- 1\n>\n> x\n> ```\n", "x <- 1\n\nx")
+code_is("list indent comes off the code", "- a\n\n    ```{r}\n    y <- 1\n    ```\n", "y <- 1")
+roundtrip("four-backtick chunk", "T\n````{r}\n```\nx\n````\n")
+roundtrip("mixed line endings stay mixed", "a\r\nb\nc\n")
+
 print(string.format("rmd: %d checks passed", passed))

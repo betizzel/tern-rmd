@@ -1,0 +1,8 @@
+# Tern's API types for luau-lsp; regenerate with `tern plugin types .`
+tern.d.luau
+
+# R and editor leftovers
+.Rhistory
+.RData
+.Rproj.user/
+.DS_Store

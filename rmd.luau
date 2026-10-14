@@ -9,9 +9,10 @@
 --     ```
 --
 -- Chunks are found the way knitr finds them (a fence line of three or more
--- backticks followed by `{engine ...}`, closed by the next bare fence line),
--- so a file round-trips through parse and serialize unchanged, and what the
--- notebook calls a chunk is what knitr will run when the file is knitted.
+-- backticks followed by `{engine ...}`, closed by the next bare fence line
+-- with the same prefix and backtick count), so a file round-trips through
+-- parse and serialize unchanged, and what the notebook calls a chunk is what
+-- knitr will run when the file is knitted.
 --
 -- Markdown has no cell boundaries of its own: the text between two chunks is
 -- one Markdown cell. Text that is only blank lines becomes a *spacer*, kept so
@@ -86,13 +87,12 @@ local function split_md(c: Cell, raw: string)
 end
 
 local function chunk_begin(line: string): (string?, string?, string?)
-	-- knitr: ^[\t >]*```+\s*\{((([a-zA-Z0-9_]+)(.*)))\}\s*$
-	local prefix, fence, braces = string.match(line, "^([\t >]*)(```+)%s*(%b{})%s*$")
-	if not prefix or not braces then
+	-- knitr: ^[\t >]*```+\s*\{([a-zA-Z0-9_]+( *[ ,].*)?)\}\s*$
+	local prefix, fence, header = string.match(line, "^([\t >]*)(```+)%s*{(.*)}%s*$")
+	if not prefix or not fence or not header then
 		return nil, nil, nil
 	end
-	local header = string.sub(braces, 2, -2)
-	if not string.match(header, "^[%w_]") then
+	if not (string.match(header, "^[%w_]+$") or string.match(header, "^[%w_]+ *[ ,]")) then
 		return nil, nil, nil
 	end
 	return prefix, fence, header
@@ -102,11 +102,33 @@ local function chunk_end(line: string): boolean
 	return string.match(line, "^[\t >]*```+%s*$") ~= nil
 end
 
+-- The closing fence of the chunk that opened at `lines[from - 1]` with
+-- `own` (its prefix and backticks), as knitr matches it: a bare fence with the
+-- same prefix and backtick count. A new chunk opening with that fence first
+-- means this one never closed.
+local function chunk_stop(lines: { string }, from: number, own: string): number?
+	for j = from, #lines do
+		local line = lines[j]
+		if chunk_end(line) and string.match(line, "^(.-)%s*$") == own then
+			return j
+		end
+		local prefix, fence = chunk_begin(line)
+		if prefix and fence and string.sub(prefix .. fence, 1, #own) == own then
+			return nil
+		end
+	end
+	return nil
+end
+
 function M.parse(text: string, seq: number?): Doc
 	local doc: Doc = {
 		cells = {},
 		seq = seq or 0,
-		crlf = string.find(text, "\r\n", 1, true) ~= nil,
+		-- Only a file whose every line ends in CRLF is normalised (and written
+		-- back with CRLF); mixed endings stay exactly as they are.
+		crlf = string.find(text, "\r\n", 1, true) ~= nil
+			and string.find(text, "[^\r]\n") == nil
+			and string.sub(text, 1, 1) ~= "\n",
 		final_newline = text == "" or string.sub(text, -1) == "\n",
 	}
 	if doc.crlf then
@@ -152,12 +174,7 @@ function M.parse(text: string, seq: number?): Doc
 		local prefix, fence, header = chunk_begin(line)
 		local stop: number? = nil
 		if prefix and fence and header then
-			for j = i + 1, #lines do
-				if chunk_end(lines[j]) then
-					stop = j
-					break
-				end
-			end
+			stop = chunk_stop(lines, i + 1, prefix .. fence)
 		end
 		if prefix and fence and header and stop then
 			flush_md()
@@ -243,6 +260,30 @@ function M.label(c: Cell): string?
 		return (string.gsub(first, "^%s*(.-)%s*$", "%1"))
 	end
 	return nil
+end
+
+-- Code from chunk `c` (its whole source, or `src`, a part of it) the way knitr
+-- runs it: the fence's prefix (the `> ` of a blockquote, the indent of a list
+-- item) comes off the start of each line, then that prefix without its
+-- trailing whitespace (a bare `>`), exactly as knitr's parse_block does.
+function M.code(c: Cell, src: string?): string
+	local text = src or c.src
+	local full = c.prefix
+	if full == "" then
+		return text
+	end
+	local bare = string.match(full, "^(.-)%s*$") or ""
+	local out = {}
+	for line in string.gmatch(text .. "\n", "([^\n]*)\n") do
+		if string.sub(line, 1, #full) == full then
+			line = string.sub(line, #full + 1)
+		end
+		if bare ~= "" and string.sub(line, 1, #bare) == bare then
+			line = string.sub(line, #bare + 1)
+		end
+		table.insert(out, line)
+	end
+	return table.concat(out, "\n")
 end
 
 function M.new_code(doc: Doc, src: string?): Cell

@@ -1,5 +1,5 @@
 -- Tests for ../buffer.luau. Run from the plugin directory:
---   /tmp/ternsdk/bin/luau tests/buffer_test.luau
+--   luau tests/buffer_test.luau
 -- Plain asserts: the first failure aborts with a message and a stack trace.
 
 local B = require("../buffer")
@@ -156,6 +156,15 @@ local function test_enter()
 	press(b, "enter")
 	eq(b.text, "x[\n  }", "mismatched closer not moved")
 
+	-- Enter inside the indentation copies only what is left of the caret: the
+	-- text after it keeps its own indent
+	b = B.new("f <- function() {\n  x\n}", 18)
+	press(b, "enter")
+	eq(b.text, "f <- function() {\n\n  x\n}", "Enter at column 0 opens a line above, indent unchanged")
+	b = B.new("    x", 2)
+	press(b, "enter")
+	eq(b.text, "  \n    x", "Enter inside the indent keeps the line's own indent")
+
 	-- a selection is replaced by the newline
 	b = B.new("  abcd", 4)
 	b.anchor = 2
@@ -246,6 +255,12 @@ local function test_autopair()
 	eq(b.cursor, 1)
 	press(b, "backspace", nil, R)
 	eq(b.text, "", "now it is empty, so both go")
+
+	-- where the buffer doesn't pair (Markdown, the options field), the
+	-- person typed both halves: backspace takes one
+	b = B.new("see f()", 6)
+	press(b, "backspace", nil, { lang = "markdown" })
+	eq(b.text, "see f)", "Markdown: only the character before the caret")
 
 	-- a selection is wrapped
 	b = B.new("abc")
@@ -659,6 +674,16 @@ local function test_undo()
 	eq(b.text, "ab ", "the space came back with the first word")
 	eq(B.undo(b), true, "second undo")
 	eq(b.text, "", "empty")
+
+	-- every word is one step, however long
+	b = B.new("")
+	typ(b, "foo bar baz", R)
+	eq(B.undo(b), true)
+	eq(b.text, "foo bar ", "the last word goes at once")
+	eq(B.undo(b), true)
+	eq(b.text, "foo ", "then the middle one")
+	eq(B.undo(b), true)
+	eq(b.text, "", "then the first")
 
 	-- a caret move ends the group
 	b = B.new("")

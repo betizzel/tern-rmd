@@ -21,7 +21,11 @@ printf 'a,b\n1,2\n' > "$doc/df2.csv"
 
 port=$((20000 + RANDOM % 20000))
 token="tok-$RANDOM-$$"
+proof="proof-$RANDOM-$$"
 base="http://127.0.0.1:$port"
+json='Content-Type: application/json'
+# the kernel takes its secrets from the environment only
+export TERN_RMD_TOKEN="$token" TERN_RMD_PROOF="$proof"
 
 pass=0
 fail=0
@@ -40,15 +44,22 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# call METHOD PATH [JSON-BODY] [TOKEN] -> writes body to $tmp/body, echoes status
+# call METHOD PATH [JSON-BODY] [TOKEN] -> writes body to $tmp/body and headers
+# to $tmp/hdr, echoes status.  Bodies go as JSON: R's HTTP server swallows
+# curl's default form encoding.
 call() {
   local m="$1" p="$2" d="${3-}" h="${4-$token}" out
   if [ -n "$d" ]; then
-    out=$(curl -s -m 30 -o "$tmp/body" -w '%{http_code}' -H "X-Token: $h" --data-binary "$d" "$base$p")
+    out=$(curl -s -m 30 -D "$tmp/hdr" -o "$tmp/body" -w '%{http_code}' -H "X-Token: $h" -H "$json" --data-binary "$d" "$base$p")
   else
-    out=$(curl -s -m 30 -o "$tmp/body" -w '%{http_code}' -H "X-Token: $h" "$base$p")
+    out=$(curl -s -m 30 -D "$tmp/hdr" -o "$tmp/body" -w '%{http_code}' -H "X-Token: $h" "$base$p")
   fi
   printf '%s' "$out"
+}
+
+# header NAME -> the value of response header NAME in $tmp/hdr ("" if absent)
+header() {
+  awk -v n="$(printf '%s' "$1" | tr 'A-Z' 'a-z')" 'BEGIN{FS=": "} {gsub("\r",""); if (tolower($1) == n) print $2}' "$tmp/hdr"
 }
 
 # py PATH -> prints the value at a dotted path of $tmp/body (JSON)
@@ -98,7 +109,7 @@ PY
 
 # --- start the kernel --------------------------------------------------------
 
-Rscript "$kernel" --port "$port" --token "$token" --dir "$doc" --data "$data" --idle 120 \
+Rscript "$kernel" --port "$port" --dir "$doc" --data "$data" --idle 120 \
   > "$tmp/kernel.log" 2>&1 &
 kpid=$!
 
@@ -121,10 +132,12 @@ same "GET /ping -> 200" "$st" "200"
 same "ping ok" "$(py ok)" "true"
 same "ping pid is the R process" "$(py pid)" "$kpid"
 same "ping version" "$(py version)" "$(Rscript -e 'cat(as.character(getRversion()))')"
+same "an authenticated reply proves the session (X-Proof)" "$(header x-proof)" "$proof"
 
 st=$(call GET /ping "" "wrong-token")
 same "wrong token -> 403" "$st" "403"
 same "wrong token error text" "$(py error)" "bad token"
+same "a rejected request never sees the proof" "$(header x-proof)" ""
 
 st=$(curl -s -m 10 -o "$tmp/body" -w '%{http_code}' "$base/ping")
 same "missing token -> 403" "$st" "403"
@@ -132,6 +145,58 @@ same "missing token -> 403" "$st" "403"
 st=$(call GET /nope)
 same "unknown path -> 404" "$st" "404"
 same "unknown path error" "$(py error)" "not found"
+
+# R's own help server would serve docs and session files; the kernel's
+# router replaces it, so those paths need the token and then do not exist
+st=$(curl -s -m 10 -o "$tmp/body" -w '%{http_code}' "$base/doc/html/index.html")
+same "R help pages need the token" "$st" "403"
+st=$(call GET /doc/html/index.html)
+same "R help pages are not served" "$st" "404"
+st=$(call GET /session/x)
+same "R session files are not served" "$st" "404"
+
+st=$(curl -s -m 10 -o "$tmp/body" -w '%{http_code}' -H "X-Token: $token" --data-binary '{"id":"f","code":"1"}' "$base/exec")
+same "a form-encoded body -> 400" "$st" "400"
+same "the 400 says to send JSON" "$(python3 -c 'import json,sys; print(int("application/json" in json.load(open(sys.argv[1]))["error"]))' "$tmp/body")" "1"
+
+# the server listens on 127.0.0.1 only: through any other address of this
+# machine the port must be closed
+exposed=$(python3 - "$port" <<'PY'
+import socket, sys
+port = int(sys.argv[1])
+addrs = set()
+try:
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    probe.connect(("192.0.2.1", 9))      # no packet is sent; picks the outward address
+    addrs.add(probe.getsockname()[0])
+    probe.close()
+except OSError:
+    pass
+try:
+    addrs.update(socket.gethostbyname_ex(socket.gethostname())[2])
+except OSError:
+    pass
+addrs = [a for a in addrs if not a.startswith("127.")]
+if not addrs:
+    print("skip")
+    sys.exit()
+for a in addrs:
+    s = socket.socket()
+    s.settimeout(2)
+    try:
+        s.connect((a, port))
+        print("open on " + a)
+        sys.exit()
+    except OSError:
+        pass
+    finally:
+        s.close()
+print("closed")
+PY
+)
+if [ "$exposed" = skip ]; then ok "loopback only (no other address to probe)"; else same "the port is closed on every non-loopback address" "$exposed" "closed"; fi
+
+same "the data dir is private (0700)" "$(python3 -c 'import os,stat,sys; print(oct(stat.S_IMODE(os.stat(sys.argv[1]).st_mode)))' "$data")" "0o700"
 
 # the kernel must define nothing in globalenv(), even before the first chunk
 st=$(call GET /vars)
@@ -235,7 +300,7 @@ same "stream lines are items" "$streamok" "yes"
 
 # --- exec: utf-8 + content-length -------------------------------------------
 
-curl -s -m 30 -D "$tmp/hdr" -o "$tmp/body" -H "X-Token: $token" \
+curl -s -m 30 -D "$tmp/hdr" -o "$tmp/body" -H "X-Token: $token" -H "$json" \
   --data-binary '{"id":"utf","code":"cat(\"h\u00e9llo \u2713\\n\")"}' "$base/exec"
 utf8=$(python3 - "$tmp/body" <<'PY'
 import json, sys
@@ -319,6 +384,28 @@ same "width option is honoured (default 80 -> 2 wrapped lines)" "$(python3 -c 'i
 st=$(call POST /exec '{"id":"w","code":"1:40","width":30}')
 same "width option narrows wrapping" "$(python3 -c 'import json,sys; t=json.load(open(sys.argv[1]))["outputs"][0]["text"]; print(len([l for l in t.splitlines() if l.strip()]))' "$tmp/body")" "5"
 
+# --- secrets and output limits -------------------------------------------------
+
+st=$(exec_code 'cat(Sys.getenv("TERN_RMD_TOKEN"), Sys.getenv("TERN_RMD_PROOF"), "|", sep = "")')
+same "chunks cannot read the session's secrets" "$(pytext)" "|"
+st=$(exec_code 'system("env | grep -c TERN_RMD_TOKEN || true", intern = TRUE)')
+same "subprocesses do not inherit the secrets" "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["outputs"][0]["text"].split()[-1])' "$tmp/body")" '"0"'
+
+st=$(exec_code '1' 'x), cat("SMUGGLED\n"), alist(y')
+same "a ) in the chunk header cannot run extra code" "$(pytext)" "[1] 1"
+
+st=$(exec_code 'cat(strrep("x", 5e6))')
+same "a huge print is clipped" "$(python3 -c 'import json,sys; t=json.load(open(sys.argv[1]))["outputs"][0]["text"]; print(int(len(t) < 210000) + int("characters omitted" in t))' "$tmp/body")" "2"
+
+st=$(exec_code 'for (i in 1:5000) message(i)')
+same "a flood of messages is capped" "$(python3 -c 'import json,sys; o=json.load(open(sys.argv[1]))["outputs"]; print(len(o), int("more outputs not shown" in o[-1]["text"]))' "$tmp/body")" "2001 1"
+
+st=$(exec_code $'for (i in 1:3000) message(i)\nstop("late")')
+same "an error past the cap still fails the chunk" "$(py error)" "true"
+
+st=$(exec_code 'm <- matrix(1:2, 1); colnames(m) <- c("a", NA); m')
+same "NA column names arrive as \"NA\"" "$(py outputs.0.cols)" '["a", "NA"]'
+
 # --- globalenv hygiene: the kernel must not depend on (or leak into) it ------
 
 st=$(exec_code $'rm(list = ls())\ny <- 41\ny')
@@ -346,7 +433,7 @@ same "kernel keeps answering after shadowing attempts" "$(py ok)" "true"
 # --- idle timeout ------------------------------------------------------------
 
 iport=$((port + 1))
-Rscript "$kernel" --port "$iport" --token "$token" --dir "$doc" --data "$data" --idle 3 \
+Rscript "$kernel" --port "$iport" --dir "$doc" --data "$data" --idle 3 \
   > "$tmp/kernel_idle.log" 2>&1 &
 ipid=$!
 for _ in $(seq 100); do
@@ -374,8 +461,8 @@ cport=$((port + 2))
 clog="$data/console.log"
 cbase="http://127.0.0.1:$cport"
 
-# the plugin's launch form: fd 1/2 appended into TERN_RMD_LOG, token via env
-TERN_RMD_LOG="$clog" TERN_RMD_TOKEN="$token" sh -c 'exec "$@" >>"$TERN_RMD_LOG" 2>&1' sh \
+# the plugin's launch form: fd 1/2 appended into TERN_RMD_LOG, secrets via env
+TERN_RMD_LOG="$clog" sh -c 'exec "$@" >>"$TERN_RMD_LOG" 2>&1' sh \
   Rscript "$kernel" --port "$cport" --dir "$doc" --data "$data" --idle 120 &
 cpid=$!
 cready=no
@@ -392,7 +479,7 @@ cexec() {
 import json, sys
 json.dump({"id": "cc", "code": sys.argv[1]}, sys.stdout)
 PY
-  curl -s -m 30 -o "$tmp/body" -w '%{http_code}' -H "X-Token: $token" \
+  curl -s -m 30 -o "$tmp/body" -w '%{http_code}' -H "X-Token: $token" -H "$json" \
     --data-binary "$(cat "$tmp/req.json")" "$cbase/exec"
 }
 
@@ -429,11 +516,11 @@ same "invalid utf-8 is sanitised" "$(python3 -c 'import json,sys; t=json.load(op
 
 cstream="$data/console-stream.jsonl"
 python3 -c 'import json,sys; json.dump({"id":"cc-stream","code":"system(\"echo streamed\")","stream":sys.argv[1]}, sys.stdout)' "$cstream" > "$tmp/req.json"
-st=$(curl -s -m 30 -o "$tmp/body" -w '%{http_code}' -H "X-Token: $token" --data-binary @"$tmp/req.json" "$cbase/exec")
+st=$(curl -s -m 30 -o "$tmp/body" -w '%{http_code}' -H "X-Token: $token" -H "$json" --data-binary @"$tmp/req.json" "$cbase/exec")
 same "console items are streamed like every other item" "$(python3 -c 'import json,sys; print(",".join(json.loads(l)["type"] for l in open(sys.argv[1], encoding="utf-8")))' "$cstream")" "console"
 
 st=$(python3 -c 'import json,sys; json.dump({"id":"cc-log","code":"1+1","stream":"/nonexistent-dir/x.jsonl"}, sys.stdout)' > "$tmp/req.json"
-   curl -s -m 30 -o "$tmp/body" -w '%{http_code}' -H "X-Token: $token" --data-binary "$(cat "$tmp/req.json")" "$cbase/exec")
+   curl -s -m 30 -o "$tmp/body" -w '%{http_code}' -H "X-Token: $token" -H "$json" --data-binary "$(cat "$tmp/req.json")" "$cbase/exec")
 same "kernel log_msg does not leak into console items" "$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(int(any("cannot open stream file" in o.get("text","") for o in d["outputs"])))' "$tmp/body")" "0"
 same "kernel diagnostics land in DATADIR/kernel.log" "$(grep -c "cannot open stream file" "$data/kernel.log" 2>/dev/null || true)" "1"
 same "console log stays free of kernel diagnostics" "$(grep -c "cannot open stream file" "$clog" 2>/dev/null || true)" "0"
@@ -442,7 +529,7 @@ same "console log stays free of kernel diagnostics" "$(grep -c "cannot open stre
 lport=$((port + 3))
 log2="$data/console2.log"
 sh -c 'log="$1"; shift; exec "$@" >>"$log" 2>&1' sh "$log2" Rscript "$kernel" \
-  --port "$lport" --token "$token" --dir "$doc" --data "$data" --log "$log2" --idle 120 &
+  --port "$lport" --dir "$doc" --data "$data" --log "$log2" --idle 120 &
 lpid=$!
 lready=no
 for _ in $(seq 100); do
@@ -452,13 +539,13 @@ for _ in $(seq 100); do
 done
 same "--log kernel starts" "$lready" "yes"
 python3 -c 'import json,sys; json.dump({"id":"cl","code":"system(\"echo via-log-flag\")"}, sys.stdout)' > "$tmp/req.json"
-curl -s -m 30 -o "$tmp/body" -H "X-Token: $token" --data-binary "$(cat "$tmp/req.json")" "http://127.0.0.1:$lport/exec" > /dev/null
+curl -s -m 30 -o "$tmp/body" -H "X-Token: $token" -H "$json" --data-binary "$(cat "$tmp/req.json")" "http://127.0.0.1:$lport/exec" > /dev/null
 same "--log captures shell output" "$(types)" "console"
 same "--log shell text" "$(py outputs.0.text)" "via-log-flag"
-curl -s -m 5 -H "X-Token: $token" --data-binary '{}' "http://127.0.0.1:$lport/shutdown" > /dev/null
+curl -s -m 5 -H "X-Token: $token" -H "$json" --data-binary '{}' "http://127.0.0.1:$lport/shutdown" > /dev/null
 wait "$lpid" 2>/dev/null
 
-curl -s -m 5 -H "X-Token: $token" --data-binary '{}' "$cbase/shutdown" > /dev/null
+curl -s -m 5 -H "X-Token: $token" -H "$json" --data-binary '{}' "$cbase/shutdown" > /dev/null
 wait "$cpid" 2>/dev/null
 cpid=""
 

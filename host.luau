@@ -23,6 +23,11 @@ local TABLE_PAGE = 10
 local TEXT_PREVIEW_LINES = 60
 local CONSOLE_PREVIEW_LINES = 12
 local LIVE_CONSOLE_BYTES = 48 * 1024
+-- The console log is read whole while it is at most this big; past it, only
+-- its end is read (with `tail`), so a long package build stays cheap to show.
+local LIVE_READ_MAX = 1024 * 1024
+local MAX_DOC_BYTES = 64 * 1024 * 1024
+local MAX_PLOT_BYTES = 64 * 1024 * 1024
 local FIG_W, FIG_H, DPI = 7, 5, 192
 
 type Cell = rmd.Cell
@@ -32,6 +37,11 @@ type Run = {
 	outputs: { any },
 	live: { any }?, -- outputs streamed so far while it runs
 	live_sig: string?, -- what `live` was built from, to skip unchanged polls
+	-- The stream file as decoded so far: bytes consumed, the items, and how
+	-- much of the console log those items already reported.
+	stream_pos: number,
+	stream_items: { any },
+	stream_upto: number,
 	state: "idle" | "queued" | "running",
 	count: number?,
 	ms: number?,
@@ -70,6 +80,7 @@ type State = {
 	trash: { { at: number, cells: { Cell } } },
 	overlay: ("help" | "vars" | "knit")?,
 	vars: { any }?,
+	vars_note: string?, -- why the environment list is empty (R busy or not running)
 	knit: { status: "running" | "done" | "failed", out: string?, log: string? }?,
 	completion: Completion?,
 	blobs: { [string]: string },
@@ -110,6 +121,60 @@ end
 
 local function data_dir(state: State): string
 	return tern.plugin.data .. "/docs/" .. doc_key(state.path or "untitled")
+end
+
+-- The docs folder holds every notebook's outputs (and its name lists them):
+-- keep it to the person. kernel.luau also makes each notebook's own folder
+-- private before R starts.
+local docs_private = false
+local function make_docs_private()
+	if docs_private then
+		return
+	end
+	docs_private = true
+	local docs = tern.plugin.data .. "/docs"
+	pcall(tern.fs.mkdir, docs)
+	pcall(tern.process.run, { "chmod", "700", docs }, nil, function(_r) end)
+end
+
+-- The file an output names (a plot, a full console log), as a path in this
+-- document's data folder. Only the file's name is taken from the output, so
+-- whatever a reply or outputs.json says, the plugin reads, opens and deletes
+-- files in that folder alone.
+local function data_file(state: State, path: any): string?
+	if type(path) ~= "string" then
+		return nil
+	end
+	local name = basename(path)
+	if name == "." or name == ".." or not string.match(name, "^[%w._%-]+$") then
+		return nil
+	end
+	return data_dir(state) .. "/" .. name
+end
+
+-- Output items as the view can draw them: tables with a string `type`.
+-- Replies and outputs.json are checked with this before anything uses them.
+local function clean_outputs(list: any): { any }
+	local out = {}
+	if type(list) == "table" then
+		for _, o in list do
+			if type(o) == "table" and type(o.type) == "string" then
+				table.insert(out, o)
+			end
+		end
+	end
+	return out
+end
+
+-- The document's text, or nil and why it can't be read. Only regular files
+-- (not links, pipes or devices) up to MAX_DOC_BYTES are read, so opening a
+-- notebook can never hang or flood the plugin.
+local function read_doc(path: string): (string?, string?)
+	local ok, text = pcall(tern.fs.read, path, MAX_DOC_BYTES)
+	if ok then
+		return text, nil
+	end
+	return nil, tostring(text)
 end
 
 local function running(pane: number): boolean
@@ -159,7 +224,15 @@ end
 local function run_of(state: State, id: number): Run
 	local r = state.runs[id]
 	if not r then
-		r = { outputs = {}, state = "idle", collapsed = false, pages = {} }
+		r = {
+			outputs = {},
+			stream_pos = 0,
+			stream_items = {},
+			stream_upto = 0,
+			state = "idle",
+			collapsed = false,
+			pages = {},
+		}
 		state.runs[id] = r
 	end
 	return r
@@ -262,8 +335,9 @@ end
 
 local function send_blobs(state: State, outputs: { any })
 	for _, o in outputs do
-		if o.type == "plot" and type(o.file) == "string" and not state.blobs[o.file] then
-			local ok, bytes = pcall(tern.fs.read, o.file)
+		local file = data_file(state, o.file)
+		if o.type == "plot" and file and not state.blobs[o.file] then
+			local ok, bytes = pcall(tern.fs.read, file, MAX_PLOT_BYTES)
 			if ok then
 				state.blobs[o.file] = state.cx:blob(bytes, "image/png")
 			end
@@ -274,8 +348,9 @@ end
 -- Deletes the files (plots, full console logs) of outputs being replaced.
 local function drop_files(state: State, outputs: { any })
 	for _, o in outputs do
-		if type(o.file) == "string" then
-			pcall(tern.fs.remove, o.file)
+		local file = data_file(state, o.file)
+		if file then
+			pcall(tern.fs.remove, file)
 			state.blobs[o.file] = nil
 		end
 	end
@@ -294,11 +369,11 @@ local function restore_cache(state: State)
 	for _, c in cells(state) do
 		if c.kind == "code" then
 			for i, e in data.cells do
-				if not used[i] and e.src == c.src then
+				if not used[i] and type(e) == "table" and e.src == c.src then
 					used[i] = true
 					local r = run_of(state, c.id)
-					r.outputs = e.outputs or {}
-					r.ms = e.ms
+					r.outputs = clean_outputs(e.outputs)
+					r.ms = tonumber(e.ms)
 					r.count = tonumber(e.count)
 					send_blobs(state, r.outputs)
 					break
@@ -363,8 +438,8 @@ local function open_path(state: State, path: string)
 	state.path = path
 	state.dir = dirname(path)
 	state.name = basename(path)
-	local ok, text = pcall(tern.fs.read, path)
-	if ok then
+	local text, err = read_doc(path)
+	if text then
 		state.disk = text
 		load(state, text)
 	elseif not tern.fs.exists(path) then
@@ -373,7 +448,13 @@ local function open_path(state: State, path: string)
 		load(state, TEMPLATE)
 		state.dirty = true
 	else
-		state.problem = "Couldn't read " .. path .. ": " .. tostring(text)
+		state.problem = string.format(
+			"Couldn't open %s as a notebook (%s). Notebooks open from regular files up to %d MiB; "
+				.. "for a link, open the file it points to.",
+			path,
+			tostring(err),
+			MAX_DOC_BYTES // (1024 * 1024)
+		)
 		state.doc = nil
 	end
 end
@@ -384,6 +465,9 @@ local run_next: (State) -> ()
 
 local function finish(state: State, id: number, outputs: { any }, ms: number?, failed: boolean)
 	local r = run_of(state, id)
+	if state.running == id then
+		state.running = nil
+	end
 	drop_files(state, r.outputs)
 	r.outputs = outputs
 	r.live = nil
@@ -391,9 +475,6 @@ local function finish(state: State, id: number, outputs: { any }, ms: number?, f
 	r.state = "idle"
 	r.started = nil
 	send_blobs(state, outputs)
-	if state.running == id then
-		state.running = nil
-	end
 	if failed then
 		-- Like Jupyter: an error stops the cells queued after it.
 		for _, qid in state.queue do
@@ -402,6 +483,55 @@ local function finish(state: State, id: number, outputs: { any }, ms: number?, f
 		state.queue = {}
 	end
 	write_cache(state)
+end
+
+-- Decodes the stream file's new lines (whole ones only: the last may still
+-- be being written) onto the run. kernel.R caps the file, and earlier lines
+-- are never decoded twice.
+local function read_stream(r: Run, file: string)
+	local ok, text = pcall(tern.fs.read, file, 16 * 1024 * 1024)
+	if not ok or #text <= r.stream_pos then
+		return
+	end
+	local last = string.find(text, "\n[^\n]*$", r.stream_pos + 1)
+	if not last then
+		return
+	end
+	for line in string.gmatch(string.sub(text, r.stream_pos + 1, last), "([^\n]*)\n") do
+		local okd, o = pcall(tern.json.decode, line)
+		if okd and type(o) == "table" and type(o.type) == "string" then
+			table.insert(r.stream_items, o)
+			if o.type == "console" then
+				r.stream_upto = math.max(r.stream_upto, tonumber(o.upto) or 0)
+			end
+		end
+	end
+	r.stream_pos = last
+end
+
+-- The console log's size and its last LIVE_CONSOLE_BYTES, for `cb`. A log up
+-- to LIVE_READ_MAX is read whole; a bigger one (a long package build) goes
+-- through `wc` and `tail`, since tern.fs only reads whole files.
+local function console_tail(path: string, cb: (size: number, tail: string) -> ())
+	local ok, text = pcall(tern.fs.read, path, LIVE_READ_MAX)
+	if ok then
+		cb(#text, string.sub(text, -LIVE_CONSOLE_BYTES))
+		return
+	end
+	if not tern.fs.exists(path) then
+		cb(0, "")
+		return
+	end
+	local script = 'wc -c <"$1"; tail -c "$2" "$1"'
+	local started = pcall(function()
+		tern.process.run({ "sh", "-c", script, "sh", path, tostring(LIVE_CONSOLE_BYTES) }, nil, function(r)
+			local size, tail = string.match(r.stdout, "^%s*(%d+)\n(.*)$")
+			cb(tonumber(size) or 0, tail or "")
+		end)
+	end)
+	if not started then
+		cb(0, "")
+	end
 end
 
 -- While a chunk runs: the outputs kernel.R has streamed so far, plus what
@@ -413,38 +543,27 @@ local function poll_stream(state: State, id: number, file: string, log: string)
 		if state.stopped or state.running ~= id then
 			return
 		end
-		local live = {}
-		local upto = 0
-		local ok, text = pcall(tern.fs.read, file)
-		if ok then
-			for line in string.gmatch(text, "[^\n]+") do
-				local ok2, o = pcall(tern.json.decode, line)
-				if ok2 and type(o) == "table" then
-					table.insert(live, o)
-					if o.type == "console" then
-						upto = math.max(upto, tonumber(o.upto) or 0)
-					end
-				end
-			end
-		end
-		local okc, console = pcall(tern.fs.read, log)
-		local size = if okc then #console else 0
-		if size > upto then
-			local tail = string.sub(console, upto + 1)
-			if #tail > LIVE_CONSOLE_BYTES then
-				tail = "…\n" .. string.sub(tail, -LIVE_CONSOLE_BYTES)
-			end
-			table.insert(live, { type = "console", text = tail })
-		end
 		local r = run_of(state, id)
-		local sig = #live .. ":" .. size
-		if sig ~= r.live_sig then
-			send_blobs(state, live)
-			r.live = live
-			r.live_sig = sig
-			state.cx:render()
-		end
-		poll_stream(state, id, file, log)
+		read_stream(r, file)
+		console_tail(log, function(size, tail)
+			if state.stopped or state.running ~= id then
+				return
+			end
+			local live = table.clone(r.stream_items)
+			local unseen = size - r.stream_upto
+			if unseen > 0 then
+				local text = if unseen <= #tail then string.sub(tail, -unseen) else "…\n" .. tail
+				table.insert(live, { type = "console", text = text })
+			end
+			local sig = #live .. ":" .. size
+			if sig ~= r.live_sig then
+				send_blobs(state, live)
+				r.live = live
+				r.live_sig = sig
+				state.cx:render()
+			end
+			poll_stream(state, id, file, log)
+		end)
 	end)
 end
 
@@ -467,6 +586,7 @@ local function exec(state: State, id: number, code: string)
 	r.count = state.count
 	r.live = {}
 	r.live_sig = nil
+	r.stream_pos, r.stream_items, r.stream_upto = 0, {}, 0
 	state.running = id
 	if engine ~= "r" then
 		finish(state, id, {
@@ -480,7 +600,8 @@ local function exec(state: State, id: number, code: string)
 	local fig_w, fig_h = FIG_W, FIG_H
 	kernel.exec(k, {
 		id = eid,
-		code = code,
+		-- without the fence's prefix (`> `, a list indent), as knitr runs it
+		code = rmd.code(c, code),
 		opts = rest,
 		width = output_width(state),
 		fig_width = fig_w,
@@ -493,8 +614,8 @@ local function exec(state: State, id: number, code: string)
 		if state.stopped then
 			return
 		end
-		if res then
-			finish(state, id, res.outputs or {}, res.ms, res.error == true)
+		if type(res) == "table" then
+			finish(state, id, clean_outputs(res.outputs), tonumber(res.ms), res.error == true)
 		else
 			local why = if state.k and state.k.why then state.k.why else tostring(err)
 			finish(state, id, { { type = "error", text = "The R session ended: " .. why, call = "" } }, nil, true)
@@ -783,6 +904,18 @@ end
 
 -- Knitting -----------------------------------------------------------------
 
+-- What a failed knit most likely needs, put ahead of its log.
+local function knit_hint(log: string): string
+	if string.find(log, "no package called", 1, true) and string.find(log, "rmarkdown", 1, true) then
+		return 'Knitting needs the rmarkdown package. In R, run: install.packages("rmarkdown")\n\n'
+	end
+	local lower = string.lower(log)
+	if string.find(lower, "pandoc", 1, true) and (string.find(lower, "not found", 1, true) or string.find(lower, "required", 1, true)) then
+		return "Knitting needs Pandoc: install it from https://pandoc.org/installing.html (RStudio ships one too).\n\n"
+	end
+	return ""
+end
+
 local function knit(state: State)
 	if not state.path or (state.knit and state.knit.status == "running") then
 		return
@@ -791,28 +924,39 @@ local function knit(state: State)
 		save_file(state)
 	end
 	state.knit = { status = "running" }
-	local path = state.path
-	local script = "a <- commandArgs(TRUE); out <- rmarkdown::render(a[1], quiet = TRUE, envir = new.env()); cat(normalizePath(out))"
-	local ok, err = pcall(function()
-		tern.process.run({ "Rscript", "-e", script, path }, { cwd = state.dir }, function(r)
-			if state.stopped then
-				return
-			end
-			if r.status == 0 then
-				local out = string.match(r.stdout, "([^\n]+)%s*$")
-				state.knit = { status = "done", out = out }
-				state.cx:toast("success", "Knitted " .. state.name, if out then basename(out) else nil)
-			else
-				state.knit = { status = "failed", log = r.stderr .. r.stdout }
-				state.overlay = "knit"
-			end
-			state.cx:render()
-		end)
-	end)
-	if not ok then
-		state.knit = { status = "failed", log = "Couldn't start Rscript: " .. tostring(err) }
+	local path = state.path :: string
+	local dir = state.dir
+	local function failed(log: string)
+		state.knit = { status = "failed", log = knit_hint(log) .. log }
 		state.overlay = "knit"
+		state.cx:render()
 	end
+	local script = "a <- commandArgs(TRUE); out <- rmarkdown::render(a[1], quiet = TRUE, envir = new.env()); cat(normalizePath(out))"
+	-- Like the session, knitting reads the folder's .Rprofile only when the
+	-- folder is the person's own (see kernel.dotfile_env).
+	kernel.dotfile_env(dir, function(env, _skipped)
+		if state.stopped then
+			return
+		end
+		local ok, err = pcall(function()
+			tern.process.run({ "Rscript", "-e", script, path }, { cwd = dir, env = env }, function(r)
+				if state.stopped then
+					return
+				end
+				if r.status == 0 then
+					local out = string.match(r.stdout, "([^\n]+)%s*$")
+					state.knit = { status = "done", out = out }
+					state.cx:toast("success", "Knitted " .. state.name, if out then basename(out) else nil)
+					state.cx:render()
+				else
+					failed(r.stderr .. r.stdout)
+				end
+			end)
+		end)
+		if not ok then
+			failed("Couldn't start Rscript (is R installed and on the PATH?): " .. tostring(err))
+		end
+	end)
 end
 
 -- Completion ---------------------------------------------------------------
@@ -991,28 +1135,31 @@ local function table_node(id: number, i: number, o: any, page: number): Node
 	if has_names then
 		table.insert(cols, { id = "_rn", head = "", priority = 100 })
 	end
-	local names: { string } = o.cols or {}
-	local types: { string } = o.types or {}
+	local names: { any } = if type(o.cols) == "table" then o.cols else {}
+	local types: { any } = if type(o.types) == "table" then o.types else {}
 	for j, name in names do
-		local numeric = types[j] == "dbl" or types[j] == "int"
+		local kind = if types[j] ~= nil then tostring(types[j]) else nil
+		local numeric = kind == "dbl" or kind == "int"
 		table.insert(cols, {
 			id = "c" .. j,
-			head = { ui.span(name, "strong"), ui.span(if types[j] then " " .. types[j] else "", "muted") },
+			head = { ui.span(tostring(name), "strong"), ui.span(if kind then " " .. kind else "", "muted") },
 			align = if numeric then "end" else "start",
 			priority = 100 - j,
 		})
 	end
-	local data: { any } = o.rows or {}
+	local data: { any } = if type(o.rows) == "table" then o.rows else {}
 	local first = page * TABLE_PAGE + 1
 	local last = math.min(#data, first + TABLE_PAGE - 1)
 	local rows = {}
 	for r = first, last do
 		local cells_: { [string]: any } = {}
 		if has_names then
-			cells_._rn = { ui.span(tostring(o.rownames[r]), "muted") }
+			cells_._rn = { ui.span(tostring(o.rownames[r] or ""), "muted") }
 		end
-		for j, v in data[r] do
-			cells_["c" .. j] = tostring(v)
+		if type(data[r]) == "table" then
+			for j, v in data[r] do
+				cells_["c" .. j] = tostring(v)
+			end
 		end
 		table.insert(rows, { id = "r" .. r, cells = cells_ })
 	end
@@ -1080,7 +1227,7 @@ local function output_node(state: State, id: number, i: number, o: any, r: Run):
 			h = o.height,
 			alt = "Plot " .. i,
 			role = "rmd.plot",
-			path = o.file,
+			path = data_file(state, o.file),
 		})
 	elseif t == "table" then
 		return table_node(id, i, o, r.pages[i] or 0)
@@ -1298,9 +1445,10 @@ local function status_bar(state: State): Node
 			seg.title = k.why
 			seg.actions = { click = "restart" }
 		else
-			seg.text = "R · off"
+			seg.text = "R · starts with the first chunk"
 			seg.tone = "muted"
-			seg.actions = { click = "restart" }
+			seg.title = "Click to start R now"
+			seg.actions = { click = "start" }
 		end
 		table.insert(segs, ui.node("seg", seg))
 	end
@@ -1340,7 +1488,7 @@ local HELP_COMMAND = {
 	{ "Alt+↑ / Alt+↓", "move the cell up / down" },
 	{ "l", "edit the chunk's label and options" },
 	{ "o / O", "hide or show outputs / clear them" },
-	{ "R / P", "run all chunks / all chunks above" },
+	{ "R / P  or Ctrl+Alt+R / P", "run all chunks / all chunks above" },
 	{ "i i / 0 0", "interrupt / restart R" },
 	{ "e", "environment: the objects in R" },
 	{ "s or Ctrl+S", "save (also saves on its own)" },
@@ -1352,11 +1500,11 @@ local HELP_EDIT = {
 	{ "Shift+Enter", "run the chunk, select the next cell" },
 	{ "Ctrl+Enter", "run the current line or the selection" },
 	{ "Ctrl+Shift+Enter", "run the whole chunk" },
-	{ "Tab", "complete a name (Tab again cycles)" },
+	{ "Tab", "complete a name; ↑ ↓ pick, Tab or Enter accepts" },
 	{ "Alt+-  /  Ctrl+Shift+M", "insert <-  /  |>" },
 	{ "Ctrl+Shift+C or Ctrl+/", "comment or uncomment lines" },
 	{ "Ctrl+Z / Ctrl+Shift+Z", "undo / redo" },
-	{ "↑ on the first line, ↓ on the last", "move to the next cell" },
+	{ "↑ on the first line, ↓ on the last", "move to the previous / next cell" },
 }
 
 local function help_overlay(): Node
@@ -1374,7 +1522,7 @@ local function vars_overlay(state: State): Node
 	if not state.vars then
 		table.insert(kids, ui.node("spinner", { style = "dots", label = "Asking R…" }))
 	elseif #state.vars == 0 then
-		table.insert(kids, ui.text({ ui.span("The global environment is empty.", "muted") }))
+		table.insert(kids, ui.text({ ui.span(state.vars_note or "The global environment is empty.", "muted") }))
 	else
 		local rows = {}
 		for i, v in state.vars do
@@ -1784,13 +1932,15 @@ local function command_key(state: State, k: Key, ch: string): boolean
 			state.clip = {}
 			for _, r in removed do
 				if not r.spacer then
-					table.insert(state.clip, r)
+					-- a snapshot: undoing the cut (z) brings the cell itself back
+					table.insert(state.clip, table.clone(r))
 				end
 			end
 		end
 	elseif ch == "c" then
 		if c and c.kind ~= "yaml" then
-			state.clip = { c }
+			-- a snapshot, so editing the cell afterwards doesn't change the copy
+			state.clip = { table.clone(c) }
 			state.cx:toast("info", "Copied the cell", "v pastes it below, V above")
 		end
 	elseif ch == "v" then
@@ -1836,10 +1986,17 @@ local function command_key(state: State, k: Key, ch: string): boolean
 	elseif ch == "e" then
 		state.overlay = "vars"
 		state.vars = nil
-		if state.k then
-			kernel.vars(state.k, function(vars)
+		state.vars_note = nil
+		local session = state.k
+		if session then
+			kernel.vars(session, function(vars)
 				if state.overlay == "vars" then
 					state.vars = vars or {}
+					state.vars_note = if vars
+						then nil
+						elseif session.status == "busy" then "R is busy running a chunk; press e again when it finishes."
+						elseif session.status == "idle" then "R didn't answer; press e to try again."
+						else "R isn't running yet; it starts with the first chunk you run."
 					state.cx:render()
 				end
 			end)
@@ -1860,8 +2017,9 @@ local function command_key(state: State, k: Key, ch: string): boolean
 	return true
 end
 
--- Points the R session at the open document's folder and starts it, or
--- reattaches to the one a previous run of this block left running.
+-- Points the R session at the open document's folder and reattaches to the
+-- one a previous run of this block left running. A new session starts with
+-- the first chunk that runs, never on open (see kernel.luau).
 local function connect(state: State, saved: kernel.Saved?)
 	local k = state.k
 	if not k or not state.doc then
@@ -1923,8 +2081,8 @@ local function tick(state: State)
 			kernel.heartbeat(state.k)
 		end
 		if state.path and state.doc and state.ticks % DISK_TICKS == 0 then
-			local ok, text = pcall(tern.fs.read, state.path)
-			if ok and text ~= state.disk then
+			local text = read_doc(state.path :: string)
+			if text and text ~= state.disk then
 				if state.dirty then
 					if not state.conflict then
 						state.conflict = true
@@ -1971,6 +2129,7 @@ local notebook: BlockDef<State> = {
 			trash = {},
 			overlay = nil,
 			vars = nil,
+			vars_note = nil,
 			knit = nil,
 			completion = nil,
 			blobs = {},
@@ -1979,6 +2138,7 @@ local notebook: BlockDef<State> = {
 			ticks = 0,
 		}
 		local path = if saved and saved.path then saved.path elseif args[1] then absolute(args[1], cx.cwd) else nil
+		make_docs_private()
 		local k = kernel.new(state.dir, tern.plugin.data .. "/docs/untitled", function() end)
 		k.notify = function()
 			if state.stopped or not running(cx.pane) then
@@ -1997,7 +2157,7 @@ local notebook: BlockDef<State> = {
 			if saved and type(saved.unsaved) == "string" and state.doc then
 				-- Edits the last run hadn't saved yet (a reload mid-edit).
 				reload(state, saved.unsaved)
-				state.disk = if tern.fs.exists(path) then tern.fs.read(path) else ""
+				state.disk = read_doc(path) or ""
 				state.dirty = true
 			end
 			restore_cache(state)
@@ -2108,12 +2268,17 @@ local notebook: BlockDef<State> = {
 			interrupt(state)
 		elseif act == "restart" then
 			restart(state)
+		elseif act == "start" then
+			if state.k and (state.k.status == "off" or state.k.status == "dead") then
+				kernel.start(state.k)
+			end
 		elseif act == "log" and value then
 			local cid, oi = string.match(value, "^(%d+):(%d+)$")
 			local r = state.runs[tonumber(cid) or -1]
 			local o = r and r.outputs[tonumber(oi) or -1]
-			if o and type(o.file) == "string" then
-				state.cx:open(o.file)
+			local file = o and data_file(state, o.file)
+			if file then
+				state.cx:open(file)
 			end
 		elseif act == "fold" and id then
 			run_of(state, id).collapsed = false

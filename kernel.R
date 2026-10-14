@@ -2,18 +2,19 @@
 # ============================================================================
 # tern-rmd kernel -- a persistent R session for the Tern "rmd" plugin.
 #
-# The plugin (Luau host) spawns this script and talks to it over plain
-# HTTP/1.1 on 127.0.0.1.  Launch (cwd is also DOCDIR):
+# The plugin (Luau host) spawns this script and talks to it over HTTP/1.1 on
+# 127.0.0.1.  Launch (cwd is also DOCDIR):
 #
-#   TERN_RMD_TOKEN=T Rscript kernel.R --port P --dir DOCDIR --data DATADIR [--idle S]
+#   TERN_RMD_TOKEN=T TERN_RMD_PROOF=P \
+#     Rscript kernel.R --port PORT --dir DOCDIR --data DATADIR [--idle S] [--log FILE]
 #
-# (`--token T` works too, but the environment keeps the token out of `ps`.)
+# Secrets travel in the environment, never in argv, so `ps` cannot show them.
 #
 # Exit status: 2 = bad arguments / unusable data dir, 3 = cannot bind port,
 #              4 = required R package missing, 0 = clean shutdown/idle exit.
 #
 # Endpoints (all require the request header `X-Token: T`, case-insensitive):
-#   GET  /ping      -> {"ok":true,"pid":<int>,"version":"4.6.1","kernel":"1.1.0"}
+#   GET  /ping      -> {"ok":true,"pid":<int>,"version":"4.6.1","kernel":"2.0.0"}
 #   POST /exec      -> {"ok":true,"outputs":[...],"ms":<num>,
 #                       "error":<bool>,"interrupted":<bool>,"skipped":<bool>}
 #   POST /complete  -> {"ok":true,"token":"mod","matches":[...]}
@@ -23,19 +24,27 @@
 # Everything else: 403 {"ok":false,"error":"bad token"}, 404 unknown path,
 # 400 malformed body, 500 internal error.  Every response carries
 # `Content-Type: application/json; charset=utf-8`, an exact byte
-# `Content-Length` and `Connection: close`; the socket is closed afterwards.
+# `Content-Length`, `Connection: close` and `X-Proof: P`.
+#
+# Security model:
+#  * The server is R's own HTTP server (the one behind dynamic help), which
+#    listens on 127.0.0.1 only: the session is unreachable from the network.
+#    The kernel replaces that server's request router, so R's help pages and
+#    session files are never served; every request goes through the token
+#    check.
+#  * `X-Token` authenticates the plugin to the kernel.  `X-Proof` (a second
+#    secret the plugin generated) authenticates the kernel to the plugin: a
+#    process squatting on the port cannot answer as this session.
+#  * DATADIR (outputs, plots, logs) is made private to the user (mode 0700).
 #
 # Notes for the host (things that are easy to get wrong):
-#  * the server is single threaded: it reads and answers one request at a time.
-#    Do not open a second request while an /exec is still in flight.
-#  * send SIGINT to the Rscript process itself (spawn Rscript directly, not
-#    through a shell/wrapper), otherwise you signal the wrapper and the R
-#    process keeps running.  SIGINT while idle is harmless: the kernel keeps
-#    serving.
-#  * `--idle 0` (or negative) disables the idle timeout.
-#  * base R's serverSocket() has no host argument, so the port is bound on all
-#    interfaces; `X-Token` is the only protection.  (Set a firewall rule or
-#    prefer localhost-only traffic if that matters.)
+#  * requests are served one at a time; a request sent while /exec runs waits
+#    until the chunk has finished.
+#  * send SIGINT to the R process itself (Rscript and the sh wrapper below
+#    exec into it, so its pid is the one /ping reports).  A SIGINT outside
+#    user code is harmless: the kernel keeps serving.
+#  * `--idle 0` (or negative) disables the idle timeout.  Only authenticated
+#    requests count as activity.
 #  * /exec runs the code in globalenv() with the session's variables, so
 #    `ls()`, /vars and /complete all see the same objects.
 #  * the kernel keeps every one of its own objects in a private environment:
@@ -63,6 +72,11 @@
 #  * `results='hide'` drops printed output *and* table outputs (both are
 #    "results"); warning=/message=FALSE drop those items; other knitr options
 #    (echo, include, ...) are accepted and ignored.
+#  * output is bounded so a runaway chunk cannot freeze the notebook: a text
+#    item keeps its first and last characters (TEXT_LIMIT), a chunk keeps at
+#    most MAX_ITEMS items (errors always survive), and a reply that would
+#    still exceed REPLY_LIMIT bytes drops its trailing items.  Each cut is
+#    announced in the output.
 #  * the stream file gets every output item as one JSON object per line, as
 #    soon as it is produced, except plots: those lines are appended once the
 #    chunk finished and the PNGs were written (a plot line therefore always
@@ -83,8 +97,8 @@
 #    text c).  Items larger than 64 KiB are cut to first 8 KiB + a note + last
 #    48 KiB and carry `file`, the exec's full log copied to
 #    DATADIR/<id>-console.log.  While a console log is active, kernel
-#    diagnostics go to DATADIR/kernel.log instead of stderr and the token may
-#    come from TERN_RMD_TOKEN; without a log everything behaves as before.
+#    diagnostics go to DATADIR/kernel.log instead of stderr; without a log
+#    they go to stderr.
 #    Caveat: R cannot wake itself while it is blocked inside one long silent
 #    subprocess, so such a subprocess delivers its output at the next R-level
 #    output (which install.packages() produces between steps).
@@ -107,11 +121,47 @@ local({
 
   # Bumped with every protocol change: the plugin restarts a session whose
   # kernel version differs from the one it ships with.
-  KERNEL_VERSION <- "1.1.0"
+  KERNEL_VERSION <- "2.0.0"
+
+  # Output bounds (see "output is bounded" above).  REPLY_LIMIT stays well
+  # under the 16 MiB the plugin's HTTP client accepts for one reply.
+  TEXT_LIMIT <- 200000L                  # characters per text-like item
+  MAX_ITEMS <- 2000L                     # output items per chunk
+  REPLY_LIMIT <- 12 * 1024^2             # bytes of JSON per /exec reply
+  STREAM_LIMIT <- 8 * 1024^2             # bytes written to the stream file
 
   # ---------------------------------------------------------------- utilities
 
   `%||%` <- function(a, b) if (is.null(a)) b else a
+
+  # A very long text keeps its first three quarters and its last quarter of
+  # TEXT_LIMIT characters, with a note where the middle was cut.
+  clip_text <- function(txt) {
+    if (!is.character(txt) || length(txt) != 1L || is.na(txt)) return(txt)
+    n <- nchar(txt, type = "chars", allowNA = TRUE)
+    if (is.na(n)) {
+      # not valid in its encoding: count bytes instead
+      n <- nchar(txt, type = "bytes")
+      if (n <= TEXT_LIMIT) return(txt)
+      txt <- iconv(txt, from = "UTF-8", to = "UTF-8", sub = "?")
+      n <- nchar(txt, type = "chars", allowNA = TRUE)
+      if (is.na(n)) return("<unprintable output>")
+    }
+    if (n <= TEXT_LIMIT + 1000L) return(txt)
+    head <- TEXT_LIMIT %/% 4L * 3L
+    tail <- TEXT_LIMIT %/% 4L
+    paste0(substr(txt, 1L, head),
+           sprintf("\n\u2026 %s characters omitted \u2026\n",
+                   format(n - head - tail, big.mark = ",")),
+           substr(txt, n - tail + 1L, n))
+  }
+
+  # Text-like items carry `text`; tables, plots and console items do not need
+  # clipping (console items are cut by flush_console itself).
+  clip_item <- function(item) {
+    if (item$type %in% c("text", "message", "warning", "error")) item$text <- clip_text(item$text)
+    item
+  }
 
   # Diagnostics.  When a console log is active (see the console section below)
   # fd 2 belongs to the user, so kernel messages go to DATADIR/kernel.log
@@ -240,14 +290,18 @@ local({
     rows <- lapply(seq_len(n_show), function(i) I(cells[i, , drop = TRUE]))
 
     default_rn <- default_rn || length(row_names) == 0L
-    rn <- if (default_rn) NULL else I(as.character(row_names)[seq_len(n_show)])
+    # NA names would reach the plugin as JSON null; R prints them as "NA"
+    rn <- if (default_rn) NULL else as.character(row_names)[seq_len(n_show)]
+    if (!is.null(rn)) rn <- I(ifelse(is.na(rn), "NA", rn))
+    col_names <- as.character(col_names)
+    col_names[is.na(col_names)] <- "NA"
 
     list(
       type = "table",
       class = cls,
       nrow = n_r,
       ncol = n_c,
-      cols = I(as.character(col_names)),
+      cols = I(col_names),
       types = I(vapply(cols, col_type, "")),
       rownames = rn,
       rows = rows
@@ -262,8 +316,10 @@ local({
     col <- new.env(parent = emptyenv())
     col$items <- list()
     col$n <- 0L
+    col$dropped <- 0L        # items past MAX_ITEMS, announced at the end
     col$max_rows <- max_rows
     col$stream <- stream_con
+    col$stream_bytes <- 0
     col$hide_text <- isTRUE(hide$text)
     col$hide_message <- isTRUE(hide$message)
     col$hide_warning <- isTRUE(hide$warning)
@@ -291,13 +347,23 @@ local({
   write_stream_line <- function(col, item) {
     if (is.null(col$stream) || !isTRUE(col$stream_ok)) return(invisible(NULL))
     err <- tryCatch({
-      cat(json_str(item), "\n", sep = "", file = col$stream)
+      line <- json_str(clip_item(item))
+      col$stream_bytes <- col$stream_bytes + nchar(line, type = "bytes") + 1
+      if (col$stream_bytes > STREAM_LIMIT) {
+        # the live view has shown enough; the final reply has the rest
+        line <- json_str(list(type = "message",
+                              text = "\u2026 more output arrives when the chunk finishes\n"))
+        col$stream_ok <- FALSE
+      }
+      cat(line, "\n", sep = "", file = col$stream)
       flush(col$stream)
       NULL
     }, error = function(e) conditionMessage(e))
     if (!is.null(err)) {
       log_msg("stream write failed: ", err)
       col$stream_ok <- FALSE
+    }
+    if (!isTRUE(col$stream_ok)) {
       tryCatch(close(col$stream), error = function(e) NULL)
       col$stream <- NULL
     }
@@ -306,7 +372,12 @@ local({
 
   # Append an item to the response (and the stream file) without touching the
   # console log; used by everything, including the console reader itself.
+  # Past MAX_ITEMS only errors are kept: they decide whether the chunk failed.
   col_add_item <- function(col, item) {
+    if (col$n >= MAX_ITEMS && !identical(item$type, "error")) {
+      col$dropped <- col$dropped + 1L
+      return(invisible(NULL))
+    }
     col$n <- col$n + 1L
     col$items[[col$n]] <- item
     if (item_wanted(col, item)) write_stream_line(col, item)
@@ -418,21 +489,26 @@ local({
   # ------------------------------------------------------------ chunk options
 
   # knitr chunk options ("fig.width=8, warning=FALSE", possibly starting with a
-  # bare label such as "setup, include=FALSE").  Malformed text is ignored.
+  # bare label such as "setup, include=FALSE").  The text must parse as the
+  # arguments of one call, so a `)` cannot close the call early and smuggle in
+  # a second expression; malformed text is ignored.  Option values are R
+  # expressions evaluated in globalenv(), as knitr does when it runs the chunk.
   parse_chunk_opts <- function(text) {
-    text <- trimws(text %||% "")
+    if (!is.character(text) || length(text) != 1L || is.na(text)) return(list())
+    text <- trimws(text)
     if (!nzchar(text)) return(list())
-    parsed <- tryCatch(eval(parse(text = sprintf("alist(%s)", text)),
-                            envir = globalenv()),
-                       error = function(e) NULL)
-    if (!is.list(parsed) || !length(parsed)) return(list())
-    nms <- names(parsed)
+    exprs <- tryCatch(parse(text = sprintf("alist(%s)", text), keep.source = FALSE),
+                      error = function(e) NULL)
+    if (length(exprs) != 1L || !is.call(exprs[[1L]]) ||
+        !identical(exprs[[1L]][[1L]], as.name("alist"))) return(list())
+    args <- as.list(exprs[[1L]])[-1L]
+    nms <- names(args)
     if (is.null(nms)) return(list())
     out <- list()
-    for (i in seq_along(parsed)) {
+    for (i in seq_along(args)) {
       nm <- nms[[i]]
-      if (is.null(nm) || !nzchar(nm)) next          # bare label: skip, do not eval
-      v <- tryCatch(eval(parsed[[i]], envir = globalenv()), error = function(e) NULL)
+      if (!nzchar(nm)) next                         # bare label: skip, do not eval
+      v <- tryCatch(eval(args[[i]], envir = globalenv()), error = function(e) NULL)
       if (!is.null(v)) out[[nm]] <- v
     }
     out
@@ -473,6 +549,13 @@ local({
     TRUE
   }
 
+  # The PNG backend for both the recording device and the written plots (the
+  # two must match for byte-identical output).  Cairo when R has it, else
+  # R's own default, so an R built without cairo still draws plots.
+  png_type <- function() {
+    if (isTRUE(capabilities("cairo"))) "cairo" else getOption("bitmapType")
+  }
+
   # Replay a recorded plot into a PNG.  The target device must have the display
   # list enabled or replayPlot() is a silent no-op (R >= 4.5 behaviour).
   render_plot <- function(plot, file, width_px, height_px, dpi) {
@@ -480,7 +563,7 @@ local({
     painted <- FALSE
     tryCatch({
       grDevices::png(filename = file, width = width_px, height = height_px,
-                     res = dpi, type = "cairo", bg = "white")
+                     res = dpi, type = png_type(), bg = "white")
       opened <- TRUE
       grDevices::dev.control(displaylist = "enable")
       grDevices::replayPlot(plot)
@@ -646,9 +729,13 @@ local({
     state$collector <- col
     on.exit({
       state$collector <- NULL
-      if (!is.null(stream_con)) tryCatch(close(stream_con), error = function(e) NULL)
+      # write_stream_line() may have closed the stream already
+      if (!is.null(col$stream)) tryCatch(close(col$stream), error = function(e) NULL)
     }, add = TRUE)
 
+    # The reply, from what the collector gathered.  Safe to run again after an
+    # interrupt: console flushing resumes at its offset and nothing else here
+    # has side effects.
     finish <- function(skipped, interrupted) {
       # everything the chunk wrote to fd 1/2 belongs before the response
       flush_console(col)
@@ -673,14 +760,24 @@ local({
           return(it)
         }
         it$plot <- NULL
-        it
+        clip_item(it)
       })
       items <- items[!vapply(items, is.null, TRUE)]
+      if (col$dropped > 0L) {
+        items[[length(items) + 1L]] <- note_item(sprintf(
+          "%s more outputs not shown (a chunk shows at most %s)",
+          format(col$dropped, big.mark = ","), format(MAX_ITEMS, big.mark = ",")))
+      }
       ms <- round(as.numeric(difftime(Sys.time(), t_start, units = "secs")) * 1000, 1)
       has_error <- any(vapply(items, function(it) identical(it$type, "error"), TRUE))
-      list(status = 200L, payload = list(ok = TRUE, outputs = items, ms = ms,
-                                         error = has_error, interrupted = interrupted,
-                                         skipped = skipped))
+      payload <- list(ok = TRUE, outputs = items, ms = ms, error = has_error,
+                      interrupted = interrupted, skipped = skipped)
+      json <- json_str(payload)
+      if (nchar(json, type = "bytes") > REPLY_LIMIT) {
+        payload$outputs <- fit_items(items)
+        json <- json_str(payload)
+      }
+      list(status = 200L, json = json)
     }
 
     if (skip) return(finish(TRUE, FALSE))
@@ -695,7 +792,7 @@ local({
     device_ok <- tryCatch({
       grDevices::png(filename = scratch, width = max(1L, as.integer(round(fig_w * dpi))),
                      height = max(1L, as.integer(round(fig_h * dpi))), res = dpi,
-                     type = "cairo", bg = "white")
+                     type = png_type(), bg = "white")
       grDevices::dev.control(displaylist = "enable")
       dev_num <- grDevices::dev.cur()
       TRUE
@@ -754,7 +851,38 @@ local({
     if (interrupted) {
       push_item(col, list(type = "error", text = "Interrupted", call = ""))
     }
-    finish(FALSE, interrupted)
+    # A second SIGINT (`i i` pressed twice) can land while the reply is being
+    # built; build it again rather than lose the chunk's outputs.
+    for (attempt in 1:5) {
+      res <- tryCatch(finish(FALSE, interrupted), interrupt = function(e) NULL)
+      if (!is.null(res)) return(res)
+    }
+    interrupted_reply()
+  }
+
+  # A muted line in the output saying what was left out.
+  note_item <- function(text) {
+    list(type = "message", text = paste0("\u2026 ", text, "\n"))
+  }
+
+  # The leading outputs that fit in REPLY_LIMIT, plus a note saying how many
+  # did not.  Errors always stay: they are small once clipped, and they tell
+  # the plugin the chunk failed.
+  fit_items <- function(items) {
+    sizes <- vapply(items, function(it) nchar(json_str(it), type = "bytes") + 1, 0)
+    is_error <- vapply(items, function(it) identical(it$type, "error"), TRUE)
+    budget <- REPLY_LIMIT - 65536 - sum(sizes[is_error])
+    keep <- is_error | cumsum(ifelse(is_error, 0, sizes)) <= budget
+    c(items[keep], list(note_item(sprintf(
+      "%d outputs were too large to show here; write big results to a file instead",
+      sum(!keep)))))
+  }
+
+  # What /exec answers when an interrupt hit outside the chunk's own code.
+  interrupted_reply <- function() {
+    list(status = 200L, payload = list(
+      ok = TRUE, ms = 0, error = TRUE, interrupted = TRUE, skipped = FALSE,
+      outputs = list(list(type = "error", text = "Interrupted", call = ""))))
   }
 
   # ------------------------------------------------------------- /complete
@@ -796,188 +924,144 @@ local({
     list(ok = TRUE, vars = vars)
   }
 
-  # --------------------------------------------------------------- HTTP bits
+  # --------------------------------------------------------------------- HTTP
+  #
+  # Requests arrive through R's built-in HTTP server (Rhttpd, started in
+  # main()): it listens on 127.0.0.1 only, reads each request whole and calls
+  # tools:::httpd(path, query, body, headers), which the kernel replaces with
+  # `dispatch` below.  Rhttpd runs one request at a time on R's main thread,
+  # whenever the main loop sleeps.  Two Rhttpd facts shape the code: it does
+  # not tell a handler the method of a request (GET and POST differ only in
+  # the body), and it swallows form-encoded bodies, so POST bodies must be
+  # sent as application/json.
 
-  status_text <- function(status) {
-    switch(as.character(status), "200" = "OK", "400" = "Bad Request",
-           "403" = "Forbidden", "404" = "Not Found", "413" = "Payload Too Large",
-           "500" = "Internal Server Error", "Error")
-  }
-
-  respond_json <- function(con, status, payload) {
-    body <- charToRaw(enc2utf8(json_str(payload)))
-    head <- sprintf(paste0("HTTP/1.1 %d %s\r\n",
-                           "Content-Type: application/json; charset=utf-8\r\n",
-                           "Content-Length: %d\r\n",
-                           "Connection: close\r\n\r\n"),
-                    status, status_text(status), length(body))
-    writeBin(charToRaw(head), con)
-    writeBin(body, con)
-    flush(con)
-    invisible(NULL)
-  }
-
-  # TRUE once `buf` ends with the empty line of an HTTP header block.
-  header_complete <- function(buf) {
-    n <- length(buf)
-    if (n >= 4L && buf[[n]] == as.raw(10) && buf[[n - 1L]] == as.raw(13) &&
-        buf[[n - 2L]] == as.raw(10) && buf[[n - 3L]] == as.raw(13)) return(TRUE)
-    if (n >= 2L && buf[[n]] == as.raw(10) && buf[[n - 1L]] == as.raw(10)) return(TRUE)
-    if (n >= 3L && buf[[n]] == as.raw(10) && buf[[n - 1L]] == as.raw(13) &&
-        buf[[n - 2L]] == as.raw(10)) return(TRUE)
-    FALSE
-  }
-
-  # Read one whole request.  The connection is blocking, so headers are read byte
-  # by byte (a blocking readBin() would wait for the full requested count) while
-  # the body is read in one go, its length being known.
-  read_request <- function(con, timeout = 20) {
-    buf <- raw(0)
-    repeat {
-      if (length(buf) > 262144L) return(NULL)
-      if (!socketSelect(list(con), timeout = timeout)) return(NULL)
-      b <- tryCatch(readBin(con, "raw", n = 1L), error = function(e) NULL)
-      if (is.null(b) || length(b) == 0L) return(NULL)
-      buf <- c(buf, b)
-      if (header_complete(buf)) break
+  # The header block Rhttpd hands over ("Name: value" lines) -> a list with
+  # lower-case names.  A line that is not valid text is skipped.
+  parse_headers <- function(raw) {
+    out <- list()
+    lines <- tryCatch(strsplit(rawToChar(raw), "\r?\n", useBytes = TRUE)[[1L]],
+                      error = function(e) character(0))
+    for (ln in lines) {
+      kv <- tryCatch({
+        name <- sub(":.*$", "", ln, useBytes = TRUE)
+        if (identical(name, ln) || !nzchar(name)) NULL
+        else list(tolower(trimws(name)), trimws(sub("^[^:]*:", "", ln, useBytes = TRUE)))
+      }, error = function(e) NULL)
+      if (!is.null(kv)) out[[kv[[1L]]]] <- kv[[2L]]
     }
-    txt <- tryCatch(rawToChar(buf), error = function(e) NULL)
+    out
+  }
+
+  # The JSON body of a POST, or NULL when it is missing or malformed.
+  parse_body <- function(body) {
+    if (!is.raw(body) || !length(body)) return(NULL)
+    txt <- tryCatch(rawToChar(body), error = function(e) NULL)
     if (is.null(txt)) return(NULL)
-    lines <- strsplit(txt, "\n", fixed = TRUE)[[1L]]
-    lines <- sub("\r$", "", lines)
-    if (!length(lines) || !nzchar(lines[[1L]])) return(NULL)
-    parts <- strsplit(trimws(lines[[1L]]), "[ \t]+")[[1L]]
-    if (length(parts) < 2L) return(NULL)
-
-    headers <- list()
-    if (length(lines) > 1L) {
-      for (ln in lines[-1L]) {
-        if (!nzchar(ln)) next
-        i <- regexpr(":", ln, fixed = TRUE)[[1L]]
-        if (i < 1L) next
-        nm <- tolower(trimws(substr(ln, 1L, i - 1L)))
-        headers[[nm]] <- trimws(substr(ln, i + 1L, nchar(ln)))
-      }
-    }
-
-    body_txt <- ""
-    len <- suppressWarnings(as.integer(headers[["content-length"]] %||% "0"))
-    too_large <- !is.na(len) && len > 16L * 1024L * 1024L
-    if (!too_large && !is.na(len) && len > 0L) {
-      if (!socketSelect(list(con), timeout = timeout)) return(NULL)
-      body_raw <- tryCatch(readBin(con, "raw", n = len), error = function(e) NULL)
-      if (is.null(body_raw) || length(body_raw) != len) return(NULL)
-      body_txt <- tryCatch(rawToChar(body_raw), error = function(e) NULL)
-      if (is.null(body_txt)) return(NULL)
-      Encoding(body_txt) <- "UTF-8"
-    }
-
-    list(
-      method = toupper(parts[[1L]]),
-      path = sub("\\?.*$", "", parts[[2L]]),
-      headers = headers,
-      body_text = body_txt,
-      too_large = too_large
-    )
+    Encoding(txt) <- "UTF-8"
+    tryCatch(jsonlite::fromJSON(txt), error = function(e) NULL)
   }
 
-  # --------------------------------------------------------------- routing
+  # A reply in Rhttpd's format: list(body, content type, headers, status).
+  # Only replies to an authenticated request carry X-Proof, which shows the
+  # plugin that this session, and not some other program on the port,
+  # answered; a client without the token never learns it.
+  http_reply <- function(status, json, proof = TRUE) {
+    headers <- c(if (proof) paste0("X-Proof: ", cfg$proof), "Connection: close")
+    list(charToRaw(enc2utf8(json)), "application/json; charset=utf-8", headers,
+         as.integer(status))
+  }
 
-  route_request <- function(req) {
-    method <- req$method
-    path <- req$path
-    body <- NULL
-    if (identical(method, "POST")) {
-      body <- if (nzchar(req$body_text)) {
-        tryCatch(jsonlite::fromJSON(req$body_text), error = function(e) NULL)
-      } else NULL
-    }
-    if (identical(method, "GET") && identical(path, "/ping")) {
+  # The endpoints, by path alone (see above; every one needs the token).
+  # Returns list(status, payload) or list(status, json).
+  route <- function(path, body) {
+    if (identical(path, "/ping")) {
       return(list(status = 200L, payload = list(ok = TRUE, pid = Sys.getpid(),
                                                 version = as.character(getRversion()),
                                                 kernel = KERNEL_VERSION)))
     }
-    if (identical(method, "POST") && identical(path, "/exec")) {
-      if (is.null(body)) {
-        return(list(status = 400L, payload = list(ok = FALSE, error = "invalid json body")))
+    if (identical(path, "/exec")) {
+      req <- parse_body(body)
+      if (is.null(req)) {
+        return(list(status = 400L, payload = list(
+          ok = FALSE, error = "invalid json body (send it as Content-Type: application/json)")))
       }
-      return(exec_chunk(list(body = body)))
+      return(exec_chunk(list(body = req)))
     }
-    if (identical(method, "POST") && identical(path, "/complete")) {
-      line <- if (is.null(body) || is.null(body$line)) "" else as.character(body$line)[[1L]]
+    if (identical(path, "/complete")) {
+      req <- parse_body(body)
+      line <- if (is.list(req) && is.character(req$line) && length(req$line) == 1L) req$line else ""
       if (is.na(line)) line <- ""
       return(list(status = 200L, payload = complete_line(line)))
     }
-    if (identical(method, "GET") && identical(path, "/vars")) {
+    if (identical(path, "/vars")) {
       return(list(status = 200L, payload = global_vars()))
     }
-    if (identical(method, "POST") && identical(path, "/shutdown")) {
-      return(list(status = 200L, payload = list(ok = TRUE), shutdown = TRUE))
+    if (identical(path, "/shutdown")) {
+      # the main loop exits once this reply has been sent
+      state$shutdown <- TRUE
+      return(list(status = 200L, payload = list(ok = TRUE)))
     }
     list(status = 404L, payload = list(ok = FALSE, error = "not found"))
   }
 
-  # Handle one connection.  Returns TRUE when a complete request was received.
-  serve_connection <- function(con) {
-    req <- read_request(con)
-    if (is.null(req)) return(FALSE)
-    if (!identical(req$headers[["x-token"]], cfg$token)) {
-      respond_json(con, 403L, list(ok = FALSE, error = "bad token"))
-      return(TRUE)
+  # Rhttpd's entry point (installed as tools:::httpd).  The token check comes
+  # first; authenticated traffic, before and after the work, is what keeps an
+  # idle session alive.  A SIGINT that lands outside a chunk's code (it was
+  # meant for a chunk that had just finished) must not cost the reply: /exec
+  # answers "Interrupted", the other requests change nothing and are served
+  # again.
+  dispatch <- function(path, query = NULL, body = NULL, headers = NULL, ...) {
+    h <- tryCatch(parse_headers(headers), error = function(e) list(),
+                  interrupt = function(e) list())
+    if (!identical(h[["x-token"]], cfg$token)) {
+      return(http_reply(403L, json_str(list(ok = FALSE, error = "bad token")), proof = FALSE))
     }
-    if (isTRUE(req$too_large)) {
-      respond_json(con, 413L, list(ok = FALSE, error = "request too large"))
-      return(TRUE)
+    on.exit(state$last_seen <- Sys.time(), add = TRUE)
+    for (attempt in 1:3) {
+      res <- tryCatch({
+        state$last_seen <- Sys.time()
+        route(path, body)
+      }, interrupt = function(e) NULL,
+         error = function(e) {
+           log_msg("unhandled error: ", conditionMessage(e))
+           list(status = 500L, payload = list(ok = FALSE, error = paste0("kernel: ", conditionMessage(e))))
+         })
+      if (!is.null(res)) return(http_reply(res$status, res$json %||% json_str(res$payload)))
+      if (identical(path, "/exec")) return(http_reply(200L, json_str(interrupted_reply()$payload)))
     }
-    res <- tryCatch(route_request(req),
-                    error = function(e) {
-                      log_msg("unhandled error: ", conditionMessage(e))
-                      list(status = 500L, payload = list(ok = FALSE, error = paste0("kernel: ", conditionMessage(e))))
-                    })
-    respond_json(con, res$status, res$payload)
-    if (isTRUE(res$shutdown)) {
-      log_msg("shutdown requested")
-      quit(save = "no", status = 0)
-    }
-    TRUE
+    http_reply(500L, json_str(list(ok = FALSE, error = "interrupted")))
   }
 
   # ------------------------------------------------------------- arguments
 
   usage <- function() {
-    cat("usage: TERN_RMD_TOKEN=T Rscript kernel.R --port P [--token T] --dir DOCDIR --data DATADIR [--idle SECONDS]\n",
-        file = stderr())
+    cat("usage: TERN_RMD_TOKEN=T TERN_RMD_PROOF=P Rscript kernel.R --port PORT",
+        "--dir DOCDIR --data DATADIR [--idle SECONDS] [--log FILE]\n", file = stderr())
   }
 
+  # Flags take their value as `--flag value` or `--flag=value`.
   parse_argv <- function(argv) {
-    token <- Sys.getenv("TERN_RMD_TOKEN")
-    out <- list(port = NULL, token = if (nzchar(token)) token else NULL, dir = NULL, data = NULL, idle = 120)
+    env <- function(name) { v <- Sys.getenv(name); if (nzchar(v)) v else NULL }
+    out <- list(port = NULL, token = env("TERN_RMD_TOKEN"), proof = env("TERN_RMD_PROOF"),
+                dir = NULL, data = NULL, idle = 120, log = NULL)
+    flags <- c("--port", "--dir", "--data", "--idle", "--log")
     i <- 1L
     while (i <= length(argv)) {
       arg <- argv[[i]]
-      val <- NULL
-      key <- arg
-      if (grepl("=", arg, fixed = TRUE)) {
-        key <- sub("=.*$", "", arg)
-        val <- sub("^[^=]*=", "", arg)
-      } else if (i < length(argv)) {
-        val <- argv[[i + 1L]]
-      }
-      if (identical(key, "--port")) {
-        out$port <- suppressWarnings(as.integer(val)); i <- i + 2L
-      } else if (identical(key, "--token")) {
-        out$token <- val; i <- i + 2L
-      } else if (identical(key, "--dir")) {
-        out$dir <- val; i <- i + 2L
-      } else if (identical(key, "--data")) {
-        out$data <- val; i <- i + 2L
-      } else if (identical(key, "--idle")) {
-        out$idle <- suppressWarnings(as.numeric(val)); i <- i + 2L
-      } else if (identical(key, "--log")) {
-        out$log <- val; i <- i + 2L
-      } else {
+      inline <- grepl("=", arg, fixed = TRUE)
+      key <- if (inline) sub("=.*$", "", arg) else arg
+      if (!key %in% flags) {
         i <- i + 1L
+        next
       }
+      val <- if (inline) sub("^[^=]*=", "", arg) else if (i < length(argv)) argv[[i + 1L]] else NULL
+      i <- i + if (inline) 1L else 2L
+      switch(key,
+             "--port" = out$port <- suppressWarnings(as.integer(val)),
+             "--dir" = out$dir <- val,
+             "--data" = out$data <- val,
+             "--idle" = out$idle <- suppressWarnings(as.numeric(val)),
+             "--log" = out$log <- val)
     }
     out
   }
@@ -1048,9 +1132,12 @@ local({
   main <- function() {
     argv <- commandArgs(trailingOnly = TRUE)
     args <- parse_argv(argv)
+    # The secrets are in cfg now; chunks (Sys.getenv(), system("env")) and
+    # every subprocess they start must not see them.
+    Sys.unsetenv(c("TERN_RMD_TOKEN", "TERN_RMD_PROOF"))
 
     if (is.null(args$port) || is.na(args$port) || args$port < 1L || args$port > 65535L ||
-        is.null(args$token) || !nzchar(args$token) ||
+        is.null(args$token) || is.null(args$proof) ||
         is.null(args$dir) || is.null(args$data)) {
       usage()
       quit(save = "no", status = 2L)
@@ -1058,6 +1145,7 @@ local({
 
     cfg$port <- as.integer(args$port)
     cfg$token <- args$token
+    cfg$proof <- args$proof
     cfg$doc_dir <- tryCatch(normalizePath(args$dir, mustWork = FALSE), error = function(e) args$dir)
     cfg$data_dir <- tryCatch(normalizePath(args$data, mustWork = FALSE), error = function(e) args$data)
     cfg$idle <- if (is.null(args$idle) || is.na(args$idle)) 120 else as.numeric(args$idle)
@@ -1075,6 +1163,9 @@ local({
         quit(save = "no", status = 2L)
       }
     }
+    # outputs, plots and logs can hold anything a chunk printed: keep them
+    # away from other users of this machine
+    Sys.chmod(cfg$data_dir, mode = "0700", use_umask = FALSE)
     probe <- file.path(cfg$data_dir, sprintf(".tern-write-test-%d", Sys.getpid()))
     if (!tryCatch({ file.create(probe); TRUE }, error = function(e) FALSE) || !file.exists(probe)) {
       log_msg("data directory is not writable: ", cfg$data_dir)
@@ -1093,47 +1184,60 @@ local({
       cfg$kernel_log <- file.path(cfg$data_dir, "kernel.log")
     }
 
-    for (pkg in c("evaluate", "jsonlite")) {
-      if (!requireNamespace(pkg, quietly = TRUE)) {
-        log_msg("required R package is not installed: ", pkg)
+    # evaluate 1.0.4 is the first 1.x that keeps new_device = FALSE from
+    # opening a device of its own, which the plot recording relies on.
+    needs <- c(evaluate = "1.0.4", jsonlite = "1.7.0")
+    for (pkg in names(needs)) {
+      if (!requireNamespace(pkg, quietly = TRUE) ||
+          utils::packageVersion(pkg) < needs[[pkg]]) {
+        log_msg("required R package is missing or too old: ", pkg, " (needs ", needs[[pkg]], ")")
         quit(save = "no", status = 4L)
       }
     }
 
     setup_session(cfg)
     state$collector <- NULL
+    state$shutdown <- FALSE
 
-    srv <- tryCatch(serverSocket(cfg$port), error = function(e) {
-      log_msg("cannot bind port ", cfg$port, ": ", conditionMessage(e))
-      NULL
-    })
-    if (is.null(srv)) quit(save = "no", status = 3L)
+    # Serve through Rhttpd (see the HTTP section): stop a help server the
+    # user's .Rprofile may have started, route every request to `dispatch`,
+    # then listen on 127.0.0.1:PORT.  (utils::assignInNamespace() refuses base
+    # namespaces when called from a function, hence the explicit unlock.)
+    Sys.unsetenv("R_DISABLE_HTTPD")
+    tryCatch(suppressMessages(tools::startDynamicHelp(FALSE)), error = function(e) NULL)
+    tools_ns <- asNamespace("tools")
+    unlockBinding("httpd", tools_ns)
+    assign("httpd", dispatch, envir = tools_ns)
+    lockBinding("httpd", tools_ns)
+    options(help.ports = cfg$port)
+    port <- tryCatch(suppressMessages(suppressWarnings(tools::startDynamicHelp(TRUE))),
+                     error = function(e) {
+                       log_msg("cannot start the HTTP server: ", conditionMessage(e))
+                       -1L
+                     })
+    if (!identical(suppressWarnings(as.integer(port)), cfg$port)) {
+      log_msg("cannot listen on 127.0.0.1:", cfg$port)
+      quit(save = "no", status = 3L)
+    }
 
-    log_msg("kernel ", KERNEL_VERSION, " listening on port ", cfg$port,
+    log_msg("kernel ", KERNEL_VERSION, " listening on 127.0.0.1:", cfg$port,
             " (pid ", Sys.getpid(), ", R ", as.character(getRversion()), ")")
 
-    deadline <- Sys.time() + cfg$idle
+    # Rhttpd answers requests while R sleeps here; the loop itself only
+    # checks whether it is time to go.
+    state$last_seen <- Sys.time()
     repeat {
       tryCatch({
-        wait <- 1
-        if (is.finite(cfg$idle) && cfg$idle > 0) {
-          remaining <- as.numeric(difftime(deadline, Sys.time(), units = "secs"))
-          if (remaining <= 0) {
-            log_msg("idle timeout (", cfg$idle, "s), exiting")
-            tryCatch(close(srv), error = function(e) NULL)
-            quit(save = "no", status = 0L)
-          }
-          wait <- min(1, remaining)
+        Sys.sleep(0.25)
+        if (isTRUE(state$shutdown)) {
+          log_msg("shutdown requested")
+          quit(save = "no", status = 0L)
         }
-        if (!socketSelect(list(srv), timeout = wait)) next
-        con <- socketAccept(srv, blocking = TRUE, open = "a+b")
-        handled <- FALSE
-        tryCatch({
-          handled <- serve_connection(con)
-        }, error = function(e) log_msg("request failed: ", conditionMessage(e)),
-           interrupt = function(e) log_msg("interrupt outside exec ignored"))
-        tryCatch(close(con), error = function(e) NULL)
-        if (isTRUE(handled)) deadline <- Sys.time() + cfg$idle
+        idle_for <- as.numeric(difftime(Sys.time(), state$last_seen, units = "secs"))
+        if (cfg$idle > 0 && idle_for > cfg$idle) {
+          log_msg("idle timeout (", cfg$idle, "s), exiting")
+          quit(save = "no", status = 0L)
+        }
       }, error = function(e) log_msg("loop error: ", conditionMessage(e)),
          interrupt = function(e) log_msg("interrupt while idle ignored"))
     }
