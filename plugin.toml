@@ -1,0 +1,15 @@
+schema = 1
+id = "rmd"
+name = "R Notebook"
+version = "0.1.0"
+description = "R Markdown (.Rmd) files as notebooks: run chunks in a live R session, with output, plots and tables under each chunk, and knit to HTML."
+icon = "file-code"
+host = "host.luau"
+window = "window.luau"
+styles = ["notebook.css"]
+
+[[blocks]]
+id = "notebook"
+title = "R Notebook"
+icon = "file-code"
+files = ["*.Rmd"]
