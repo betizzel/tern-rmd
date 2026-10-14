@@ -81,7 +81,9 @@ type State = {
 	overlay: ("help" | "vars" | "knit")?,
 	vars: { any }?,
 	vars_note: string?, -- why the environment list is empty (R busy or not running)
-	knit: { status: "running" | "done" | "failed", out: string?, log: string? }?,
+	-- The latest knit or notebook export (see render), for the status bar.
+	knit: { status: "running" | "done" | "failed", kind: "knit" | "export", out: string?, log: string? }?,
+	export_again: boolean, -- a notebook export asked for while a render ran
 	completion: Completion?,
 	blobs: { [string]: string },
 	picker: { files: { string }, sel: number }?,
@@ -902,61 +904,158 @@ local function move_selected(state: State, delta: number)
 	reveal(state, c.id)
 end
 
--- Knitting -----------------------------------------------------------------
+-- Knitting and the notebook's HTML ------------------------------------------
+--
+-- Two ways to HTML, both in a separate R process so the session stays free:
+-- knitting renders the whole document afresh, and the notebook export writes
+-- NAME.nb.html from the outputs the notebook shows, running no chunk. That
+-- is what RStudio does for an `output: html_notebook` document: on every
+-- save, and when you press Ctrl+Shift+K (its Preview).
 
--- What a failed knit most likely needs, put ahead of its log.
-local function knit_hint(log: string): string
+type RenderKind = "knit" | "export"
+
+-- What a failed render most likely needs, put ahead of its log.
+local function knit_hint(log: string, kind: RenderKind): string
+	local what = if kind == "knit" then "Knitting" else "Saving the notebook's HTML"
 	if string.find(log, "no package called", 1, true) and string.find(log, "rmarkdown", 1, true) then
-		return 'Knitting needs the rmarkdown package. In R, run: install.packages("rmarkdown")\n\n'
+		return what .. ' needs the rmarkdown package. In R, run: install.packages("rmarkdown")\n\n'
 	end
 	local lower = string.lower(log)
 	if string.find(lower, "pandoc", 1, true) and (string.find(lower, "not found", 1, true) or string.find(lower, "required", 1, true)) then
-		return "Knitting needs Pandoc: install it from https://pandoc.org/installing.html (RStudio ships one too).\n\n"
+		return what .. " needs Pandoc: install it from https://pandoc.org/installing.html (RStudio ships one too).\n\n"
 	end
 	return ""
 end
 
-local function knit(state: State)
-	if not state.path or (state.knit and state.knit.status == "running") then
-		return
-	end
-	if state.dirty then
-		save_file(state)
-	end
-	state.knit = { status = "running" }
-	local path = state.path :: string
+-- Whether the front matter asks for an R Notebook (`output: html_notebook`).
+local function is_notebook(state: State): boolean
+	local first = cells(state)[1]
+	return first ~= nil and first.kind == "yaml" and string.find(first.src, "html_notebook", 1, true) ~= nil
+end
+
+local export: (state: State, announce: boolean) -> ()
+
+-- Runs `argv` (an Rscript) in the document's folder; the last line it prints
+-- is the file it wrote. `announce` toasts success and opens the log on
+-- failure; a quiet run (the export after a save) only updates the status bar.
+local function render(state: State, kind: RenderKind, argv: { string }, announce: boolean)
 	local dir = state.dir
-	local function failed(log: string)
-		state.knit = { status = "failed", log = knit_hint(log) .. log }
-		state.overlay = "knit"
+	state.knit = { status = "running", kind = kind }
+	local function settle()
+		if state.export_again then
+			state.export_again = false
+			export(state, false)
+		end
 		state.cx:render()
 	end
-	local script = "a <- commandArgs(TRUE); out <- rmarkdown::render(a[1], quiet = TRUE, envir = new.env()); cat(normalizePath(out))"
-	-- Like the session, knitting reads the folder's .Rprofile only when the
-	-- folder is the person's own (see kernel.dotfile_env).
+	local function failed(log: string)
+		state.knit = { status = "failed", kind = kind, log = knit_hint(log, kind) .. log }
+		if announce then
+			state.overlay = "knit"
+		else
+			state.cx:toast("error", "Couldn't write the notebook's HTML", "Click “HTML failed” in the status bar to see why.")
+		end
+		settle()
+	end
+	-- Like the session, R reads the folder's .Rprofile only when the folder
+	-- is the person's own (see kernel.dotfile_env).
 	kernel.dotfile_env(dir, function(env, _skipped)
 		if state.stopped then
 			return
 		end
 		local ok, err = pcall(function()
-			tern.process.run({ "Rscript", "-e", script, path }, { cwd = dir, env = env }, function(r)
+			tern.process.run(argv, { cwd = dir, env = env }, function(r)
 				if state.stopped then
 					return
 				end
-				if r.status == 0 then
-					local out = string.match(r.stdout, "([^\n]+)%s*$")
-					state.knit = { status = "done", out = out }
-					state.cx:toast("success", "Knitted " .. state.name, if out then basename(out) else nil)
-					state.cx:render()
-				else
+				if r.status ~= 0 then
 					failed(r.stderr .. r.stdout)
+					return
 				end
+				local out = string.match(r.stdout, "([^\n]+)%s*$")
+				state.knit = { status = "done", kind = kind, out = out }
+				if announce then
+					local title = if kind == "knit" then "Knitted " .. state.name else "Saved the notebook's HTML"
+					state.cx:toast("success", title, if out then basename(out) else nil)
+				end
+				settle()
 			end)
 		end)
 		if not ok then
 			failed("Couldn't start Rscript (is R installed and on the PATH?): " .. tostring(err))
 		end
 	end)
+end
+
+-- Writes NAME.nb.html beside the .Rmd from the outputs on screen (export.R);
+-- a request while another render runs is done once that one finishes.
+function export(state: State, announce: boolean)
+	if not state.path or not state.doc then
+		return
+	end
+	if state.knit and state.knit.status == "running" then
+		state.export_again = true
+		return
+	end
+	if state.dirty then
+		save_file(state)
+	end
+	-- Every chunk in order, with the outputs it shows; files only from the
+	-- notebook's own data folder.
+	local entries = {}
+	for _, c in cells(state) do
+		if c.kind == "code" then
+			local r = state.runs[c.id]
+			local shown: { any } = if r then r.outputs else {}
+			local outputs = {}
+			for _, o in shown do
+				local item = table.clone(o)
+				if o.file ~= nil then
+					item.file = data_file(state, o.file)
+				end
+				table.insert(outputs, item)
+			end
+			table.insert(entries, { code = rmd.code(c), outputs = tern.json.array(outputs) })
+		end
+	end
+	local list = data_dir(state) .. "/export.json"
+	local ok, err = pcall(function()
+		tern.fs.mkdir(data_dir(state))
+		tern.fs.write(list, tern.json.encode(tern.json.array(entries)))
+	end)
+	if not ok then
+		state.cx:toast("error", "Couldn't write the notebook's HTML", tostring(err))
+		return
+	end
+	render(state, "export", { "Rscript", tern.plugin.dir .. "/export.R", state.path :: string, list }, announce)
+end
+
+-- K / Ctrl+Shift+K: an R Notebook writes its HTML from what you see (RStudio's
+-- Preview); any other document is knitted afresh.
+local function knit(state: State)
+	if not state.path or (state.knit and state.knit.status == "running") then
+		return
+	end
+	if is_notebook(state) then
+		export(state, true)
+		return
+	end
+	if state.dirty then
+		save_file(state)
+	end
+	local script = "a <- commandArgs(TRUE); out <- rmarkdown::render(a[1], quiet = TRUE, envir = new.env()); cat(normalizePath(out))"
+	render(state, "knit", { "Rscript", "-e", script, state.path :: string }, true)
+end
+
+-- s / Ctrl+S: the file, and an R Notebook's HTML beside it, as RStudio does.
+local function save_now(state: State)
+	if save_file(state) then
+		local notebook = is_notebook(state)
+		state.cx:toast("success", "Saved " .. state.name, if notebook then "Writing its HTML too" else nil)
+		if notebook then
+			export(state, false)
+		end
+	end
 end
 
 -- Completion ---------------------------------------------------------------
@@ -1455,7 +1554,8 @@ local function status_bar(state: State): Node
 	local kn = state.knit
 	if kn then
 		if kn.status == "running" then
-			table.insert(segs, ui.node("seg", { key = "knit", side = "right", icon = "run", tone = "pending", text = "Knitting…", priority = 5 }))
+			local text = if kn.kind == "export" then "Saving the HTML…" else "Knitting…"
+			table.insert(segs, ui.node("seg", { key = "knit", side = "right", icon = "run", tone = "pending", text = text, priority = 5 }))
 		elseif kn.status == "done" and kn.out then
 			table.insert(segs, ui.node("seg", {
 				key = "knit",
@@ -1468,7 +1568,8 @@ local function status_bar(state: State): Node
 				priority = 5,
 			}))
 		elseif kn.status == "failed" then
-			table.insert(segs, ui.node("seg", { key = "knit", side = "right", icon = "x", tone = "error", text = "Knit failed", actions = { click = "show-knit" }, priority = 5 }))
+			local text = if kn.kind == "export" then "HTML failed" else "Knit failed"
+			table.insert(segs, ui.node("seg", { key = "knit", side = "right", icon = "x", tone = "error", text = text, actions = { click = "show-knit" }, priority = 5 }))
 		end
 	end
 	table.insert(segs, ui.node("seg", { key = "help", side = "right", icon = "keyboard", text = "?", title = "Keyboard shortcuts", actions = { click = "help" }, priority = 4 }))
@@ -1491,8 +1592,8 @@ local HELP_COMMAND = {
 	{ "R / P  or Ctrl+Alt+R / P", "run all chunks / all chunks above" },
 	{ "i i / 0 0", "interrupt / restart R" },
 	{ "e", "environment: the objects in R" },
-	{ "s or Ctrl+S", "save (also saves on its own)" },
-	{ "K or Ctrl+Shift+K", "knit to HTML (the output: in the header)" },
+	{ "s or Ctrl+S", "save (also saves on its own); an R Notebook also writes its .nb.html" },
+	{ "K or Ctrl+Shift+K", "knit to HTML; an R Notebook writes its .nb.html from what you see" },
 }
 
 local HELP_EDIT = {
@@ -1547,7 +1648,8 @@ end
 
 local function knit_overlay(state: State): Node
 	local log = if state.knit then state.knit.log or "" else ""
-	return ui.node("overlay", { key = "knit", head = "Knit failed", size = "lg", modal = true, role = "rmd.knit" }, {
+	local head = if state.knit and state.knit.kind == "export" then "Saving the notebook's HTML failed" else "Knit failed"
+	return ui.node("overlay", { key = "knit", head = head, size = "lg", modal = true, role = "rmd.knit" }, {
 		ui.node("ansi", { key = "log", text = log, max = { h = "24lines" }, follow = true }),
 		ui.text({ ui.span("Esc closes this", "muted") }),
 	})
@@ -1657,9 +1759,7 @@ local function global_key(state: State, ch: string): boolean
 		if state.mode == "edit" then
 			sync(state)
 		end
-		if save_file(state) then
-			state.cx:toast("success", "Saved " .. state.name)
-		end
+		save_now(state)
 	elseif ch == "ctrl+shift+k" then
 		sync(state)
 		knit(state)
@@ -2002,9 +2102,7 @@ local function command_key(state: State, k: Key, ch: string): boolean
 			end)
 		end
 	elseif ch == "s" then
-		if save_file(state) then
-			state.cx:toast("success", "Saved " .. state.name)
-		end
+		save_now(state)
 	elseif ch == "K" then
 		knit(state)
 	elseif ch == "?" or ch == "h" then
@@ -2131,6 +2229,7 @@ local notebook: BlockDef<State> = {
 			vars = nil,
 			vars_note = nil,
 			knit = nil,
+			export_again = false,
 			completion = nil,
 			blobs = {},
 			picker = nil,

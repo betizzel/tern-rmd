@@ -33,10 +33,10 @@ tern plugin install github.com/betizzel/tern-rmd
 
 ```r
 install.packages(c("evaluate", "jsonlite"))   # running chunks
-install.packages("rmarkdown")                 # knitting (optional)
+install.packages("rmarkdown")                 # HTML: knitting and the notebook's .nb.html (optional)
 ```
 
-Knitting also needs [Pandoc](https://pandoc.org/installing.html), which RStudio ships with.
+Making HTML also needs [Pandoc](https://pandoc.org/installing.html), which RStudio ships with.
 Run `Rscript deps.R` in the plugin's folder at any time to see what's installed.
 
 | To | Run |
@@ -79,8 +79,8 @@ notebook to see this list.
 | `R` / `P` (or `Ctrl+Alt+R` / `Ctrl+Alt+P`) | Run every chunk / every chunk above this one |
 | `i i` / `0 0` | Interrupt / restart R |
 | `e` | Environment: the objects in the R session |
-| `s` or `Ctrl+S` | Save |
-| `K` or `Ctrl+Shift+K` | Knit (renders with the `output:` from the header) |
+| `s` or `Ctrl+S` | Save (an R Notebook also writes its `.nb.html`, see [HTML](#html)) |
+| `K` or `Ctrl+Shift+K` | Knit, or for an R Notebook write its `.nb.html` from what you see |
 
 **Edit mode**:
 
@@ -100,14 +100,28 @@ You can also use the mouse: click a cell to select it, double-click it to edit i
 buttons on a chunk to run it or every chunk above it. The status bar shows R's state; click it to
 interrupt R while it runs, or to start it again after it stopped.
 
+## HTML
+
+**R Notebooks** (`output: html_notebook` in the header, as in RStudio's notebook template) work the way
+RStudio does: when you save with `s` or `Ctrl+S`, the notebook also writes `NAME.nb.html` beside the
+`.Rmd`, holding the code and the outputs you see. No chunk runs again, so it's exactly your session's
+results. RStudio opens that file with its outputs, and it's what courses usually ask you to hand in. `K`
+(or `Ctrl+Shift+K`) writes it on demand, like RStudio's Preview. Autosave doesn't write it: rendering
+evaluates the document's inline `` `r …` `` code and chunk options, so it only happens when you ask.
+Inline code that needs objects from your session shows as code in the HTML.
+
+**Other formats** (`html_document`, `pdf_document`, …): `K` knits. It runs the whole document afresh in a
+separate R process and writes what the `output:` asks for, leaving your session untouched.
+
+Both need the rmarkdown package and Pandoc (see [Install](#install)).
+
 ## Behaviour worth knowing
 
 - **Saving.** Edits are saved 1.5 s after you stop typing. If another program changes the file while the
   notebook has no unsaved edits, the notebook reloads it and keeps the output of every chunk whose code
   didn't change.
 - **Outputs** are kept in the plugin's data folder (`~/.local/state/tern/plugin-data/rmd`), not in the
-  `.Rmd`, so they come back when you reopen the notebook. Knitting writes them into the HTML; an
-  `html_notebook` header produces the `.nb.html` many courses ask for.
+  `.Rmd`, so they come back when you reopen the notebook.
 - **The R session.** Each notebook gets its own session, started in the `.Rmd`'s folder, so
   `read.csv("data.csv")` finds files next to the notebook. The session survives plugin reloads. It stops
   when you close the notebook, and if Tern goes away first it exits on its own after two idle minutes.
@@ -134,8 +148,9 @@ interrupt R while it runs, or to start it again after it stopped.
 | --- | --- |
 | *Couldn't find Rscript* | Install R from <https://cloud.r-project.org> and make sure `Rscript` is on the `PATH` Tern starts programs with. |
 | *R is missing packages the notebook needs* | Run the command the message shows (`Rscript …/deps.R --install`), or `install.packages(c("evaluate", "jsonlite"))` in R. |
-| *Knitting needs the rmarkdown package* | `install.packages("rmarkdown")` in R. |
-| *Knitting needs Pandoc* | Install Pandoc from <https://pandoc.org/installing.html>, or install RStudio. |
+| *… needs the rmarkdown package* | `install.packages("rmarkdown")` in R. |
+| *… needs Pandoc* | Install Pandoc from <https://pandoc.org/installing.html>, or install RStudio. |
+| The status bar says *HTML failed* | Click it to read why. |
 | *R didn't read this folder's .Rprofile* | The folder (or that file) can be changed by other users of this machine. Move the project to a folder of your own, or tighten its permissions (`chmod o-w`). |
 | *Running chunks needs Linux or macOS* | On Windows, use Tern inside WSL. |
 | The status bar says *R stopped* | Hover it to read why; click it to start R again. |
@@ -169,6 +184,7 @@ rather than in a public issue.
 | `kernel.R` | The R session: an HTTP API around `evaluate`, served by R's built-in server |
 | `window.luau` | Routes `.Rmd` opens to the notebook |
 | `notebook.css` | The notebook's look |
+| `export.R` | Writes an R Notebook's `.nb.html` from the outputs on screen |
 | `install.sh`, `deps.R` | Setup: the R packages and the plugin |
 
 Tern's process API only reports a program when it exits, so the R session is a small HTTP server on
@@ -186,6 +202,7 @@ tern plugin types .              # writes tern.d.luau, Tern's API types for luau
 luau tests/rmd_test.luau         # .Rmd parse/serialize round trips
 luau tests/buffer_test.luau      # editing behaviour
 tests/kernel_test.sh             # the R session's HTTP API and its security checks (needs curl, python3)
+tests/export_test.sh             # the notebook's .nb.html (needs rmarkdown and Pandoc)
 luau-lsp analyze --definitions=tern.d.luau *.luau   # type check
 ```
 

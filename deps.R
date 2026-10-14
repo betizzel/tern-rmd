@@ -4,13 +4,13 @@
 #   Rscript deps.R                    report; exit status 1 when a package needed
 #                                     to run chunks is missing or too old
 #   Rscript deps.R --install          install what running chunks needs
-#   Rscript deps.R --install --knit   ... and rmarkdown too, for knitting
+#   Rscript deps.R --install --knit   ... and rmarkdown too, for HTML (knitting, .nb.html)
 #
 # Packages go to your personal R library (created when it doesn't exist yet),
 # from CRAN unless you chose another repository.  Nothing needs root.
 
 needed <- c(evaluate = "1.0.4", jsonlite = "1.7.0")   # running chunks
-knitting <- c(rmarkdown = "2.0")                       # knitting (needs Pandoc too)
+knitting <- c(rmarkdown = "2.0")                       # HTML: knitting, .nb.html (needs Pandoc too)
 
 args <- commandArgs(trailingOnly = TRUE)
 install <- "--install" %in% args
@@ -54,7 +54,7 @@ if (getRversion() < "4.0.0") {
   quit(save = "no", status = 1L)
 }
 missing <- report(needed, "")
-missing_knit <- report(knitting, "  (for knitting)")
+missing_knit <- report(knitting, "  (for HTML)")
 # Pandoc as rmarkdown finds it (including RStudio's copy), else on the PATH.
 pandoc <- tryCatch(
   if (rmarkdown::pandoc_available()) as.character(rmarkdown::pandoc_version()) else NA_character_,
@@ -64,9 +64,9 @@ pandoc <- tryCatch(
     sub("^pandoc\\S*\\s+", "", v)
   })
 if (!is.na(pandoc)) {
-  cat(sprintf("  ok       Pandoc %s  (for knitting)\n", pandoc))
+  cat(sprintf("  ok       Pandoc %s  (for HTML)\n", pandoc))
 } else {
-  cat("  missing  Pandoc  (for knitting: https://pandoc.org/installing.html, or install RStudio)\n")
+  cat("  missing  Pandoc  (for HTML: https://pandoc.org/installing.html, or install RStudio)\n")
 }
 
 to_install <- c(if (install) missing, if (install && with_knit) missing_knit)

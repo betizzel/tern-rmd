@@ -59,8 +59,8 @@ if ! Rscript "$here/deps.R"; then
 fi
 if ! Rscript -e 'quit(status = !requireNamespace("rmarkdown", quietly = TRUE))' >/dev/null 2>&1; then
 	echo
-	if ask "Knitting to HTML needs the rmarkdown package (a larger download). Install it too?"; then
-		Rscript "$here/deps.R" --install --knit || echo "rmarkdown didn't install; knitting will tell you what's missing."
+	if ask "HTML (knitting, and the notebook's .nb.html) needs the rmarkdown package, a larger download. Install it too?"; then
+		Rscript "$here/deps.R" --install --knit || echo "rmarkdown didn't install; making HTML will tell you what's missing."
 	fi
 fi
 

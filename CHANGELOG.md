@@ -72,6 +72,11 @@ replaced the first time you run a chunk after updating.
 
 ### Added
 
+- **HTML for R Notebooks, as in RStudio.** For an `output: html_notebook`
+  document, saving with `s` or `Ctrl+S` also writes `NAME.nb.html` beside it
+  from the outputs you see, without running any chunk again; `K` writes it on
+  demand (RStudio's Preview). RStudio opens the file with its outputs. Other
+  formats still knit.
 - `install.sh`: checks R and its packages, installs what's missing into your
   personal R library, and installs the plugin.
 - `deps.R`: the package check and installer on its own.
