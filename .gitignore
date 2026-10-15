@@ -6,3 +6,7 @@ tern.d.luau
 .RData
 .Rproj.user/
 .DS_Store
+
+# what the tour notebook writes when you save or knit it
+examples/*.html
+examples/*_files/

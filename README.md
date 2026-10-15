@@ -1,4 +1,4 @@
-# R Notebook for Tern
+# ER Notebook for Tern
 
 Opens R Markdown (`.Rmd`) files in Tern as notebooks, the way Jupyter opens `.ipynb`
 files. Markdown is rendered, chunks are editable code with line numbers, and running a chunk shows its
@@ -6,7 +6,7 @@ output right under it: printed text, messages, warnings and errors, plots, and d
 tables. All chunks share one live R session, so objects carry over from chunk to chunk like they do in
 RStudio.
 
-![A notebook with printed output, a plot, and a chunk inside a blockquote](docs/screenshot.png)
+![The tour notebook, examples/demo.Rmd, after running every chunk: rendered Markdown, printed output and a paged table](docs/screenshot.png)
 
 The file on disk stays plain R Markdown. The notebook keeps the text byte for byte, line endings
 included, and only rewrites the chunks you edit, so you can knit it with `rmarkdown` as usual and
@@ -44,6 +44,24 @@ Run `Rscript deps.R` in the plugin's folder at any time to see what's installed.
 | Update | `tern plugin install github.com/betizzel/tern-rmd --force`, or `git pull && ./install.sh` |
 | Remove | `tern plugin remove rmd` |
 | Work on the plugin | `./install.sh --link` (Tern uses this folder in place) |
+
+## Try it
+
+The plugin comes with a short tour notebook, [`examples/demo.Rmd`](examples/demo.Rmd). It explains
+itself as you go and only uses base R, so it runs on any setup. From your clone:
+
+```sh
+tern open examples/demo.Rmd
+```
+
+If you installed with `tern plugin install`, copy it out of the plugin's folder first, so your edits
+and the HTML it writes stay out of the plugin:
+
+```sh
+cp "$(tern plugin dir)/rmd/examples/demo.Rmd" ~/demo.Rmd && tern open ~/demo.Rmd
+```
+
+Then press `R` to run every chunk.
 
 ## Open a notebook
 
@@ -125,7 +143,8 @@ Both need the rmarkdown package and Pandoc (see [Install](#install)).
 - **The R session.** Each notebook gets its own session, started in the `.Rmd`'s folder, so
   `read.csv("data.csv")` finds files next to the notebook. The session survives plugin reloads. It stops
   when you close the notebook, and if Tern goes away first it exits on its own after two idle minutes.
-  An error stops the chunks queued behind it, as in Jupyter.
+  An error stops the chunks queued behind it, as in Jupyter and RStudio, unless the chunk says
+  `error=TRUE`.
 - **Project setup.** Like any R started in a folder, the session reads that folder's `.Rprofile` and
   `.Renviron` (this is how renv activates a project), but only when the folder is yours. In a folder
   other people can write to, such as `/tmp`, it uses your home folder's and tells you.
@@ -186,6 +205,7 @@ rather than in a public issue.
 | `notebook.css` | The notebook's look |
 | `export.R` | Writes an R Notebook's `.nb.html` from the outputs on screen |
 | `install.sh`, `deps.R` | Setup: the R packages and the plugin |
+| `examples/demo.Rmd` | The tour notebook |
 
 Tern's process API only reports a program when it exits, so the R session is a small HTTP server on
 127.0.0.1. The plugin starts it on your first run, polls `/ping` until R answers, then sends each chunk

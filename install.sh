@@ -71,12 +71,12 @@ elif ! tern plugin install "$here" --force; then
 	fail "Tern couldn't install the plugin. If R Notebook is linked from another folder, run 'tern plugin unlink rmd' first, or use ./install.sh --link."
 fi
 
-cat <<'EOF'
+cat <<EOF
 
-All set. Open any .Rmd file in Tern, for example:
+All set. Take the tour, a notebook that explains the basics as you go:
 
-    tern open homework.Rmd
+    tern open '$here/examples/demo.Rmd'
 
-then press Shift+Enter in a chunk to run it (R starts on the first run).
-Press ? in the notebook for every shortcut.
+and press R in it to run every chunk (R starts on the first run).
+Press ? in any notebook for every shortcut.
 EOF

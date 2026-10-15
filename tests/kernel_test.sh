@@ -229,6 +229,7 @@ same "error message" "$(py outputs.0.text)" "boom"
 st=$(exec_code $'stop("boom")\ncat("AFTER\\n")' "error=TRUE")
 same "error=TRUE keeps going (types)" "$(types)" "error,text"
 same "error=TRUE keeps going (text)" "$(py outputs.1.text)" "AFTER"
+same "error=TRUE: its errors don't stop the chunks queued after it" "$(py error)" "false"
 
 st=$(exec_code $'stop("boom")\ncat("AFTER\\n")' "setup, error=TRUE, warning=FALSE")
 same "bare label + opts parse" "$(types)" "error,text"

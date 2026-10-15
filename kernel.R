@@ -69,6 +69,10 @@
 #  * `error=TRUE` keeps going at top-level-expression granularity, exactly like
 #    knitr: the rest of the failing statement is skipped, the following ones
 #    run.  Default: the error stops the chunk.
+#  * the reply's `error` says an error stopped the chunk, so the chunks queued
+#    after it should not run (as in Jupyter and RStudio).  The errors of an
+#    `error=TRUE` chunk are part of its output and don't count; an interrupt
+#    always does.
 #  * `results='hide'` drops printed output *and* table outputs (both are
 #    "results"); warning=/message=FALSE drop those items; other knitr options
 #    (echo, include, ...) are accepted and ignored.
@@ -769,8 +773,11 @@ local({
           format(col$dropped, big.mark = ","), format(MAX_ITEMS, big.mark = ",")))
       }
       ms <- round(as.numeric(difftime(Sys.time(), t_start, units = "secs")) * 1000, 1)
+      # see `error` in the header: errors that error=TRUE let through don't
+      # stop what is queued after the chunk
       has_error <- any(vapply(items, function(it) identical(it$type, "error"), TRUE))
-      payload <- list(ok = TRUE, outputs = items, ms = ms, error = has_error,
+      stopped <- isTRUE(interrupted) || (has_error && !keep_going)
+      payload <- list(ok = TRUE, outputs = items, ms = ms, error = stopped,
                       interrupted = interrupted, skipped = skipped)
       json <- json_str(payload)
       if (nchar(json, type = "bytes") > REPLY_LIMIT) {

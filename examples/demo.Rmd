@@ -1,0 +1,109 @@
+---
+title: "A tour of R Notebook for Tern"
+output: html_notebook
+---
+
+This is an ordinary R Markdown file, shown as a notebook. Text cells like this
+one are Markdown; **chunks** hold R code, and their output appears right under
+them. All chunks share one R session, so what one chunk creates, the next can
+use.
+
+To get going:
+
+- Press `R` to run every chunk, top to bottom.
+- Or move to a chunk with `j` and `k`, and press `Shift+Enter` to run it.
+- Press `Enter` to edit a cell, `Esc` to stop editing, and `?` for every shortcut.
+
+R starts the first time you run a chunk, not when a notebook opens.
+
+## Printed output
+
+```{r numbers}
+x <- c(4, 8, 15, 16, 23, 42)
+mean(x)
+summary(x)
+```
+
+`x` is still there in the next chunk:
+
+```{r}
+x * 2
+```
+
+## Tables
+
+A data frame shows as a table. The arrows under it page through the rows.
+
+```{r cars}
+mtcars
+```
+
+## Plots
+
+Chunk options such as `fig.width` and `fig.height` set a plot's size.
+
+```{r weight, fig.width=6, fig.height=4}
+plot(mtcars$wt, mtcars$mpg, pch = 19, col = "steelblue",
+     xlab = "Weight (1,000 lbs)", ylab = "Miles per gallon")
+abline(lm(mpg ~ wt, data = mtcars), col = "firebrick", lwd = 2)
+```
+
+## A model
+
+The red line is the least-squares fit of $\text{mpg} = \beta_0 + \beta_1 \cdot \text{weight}$:
+
+```{r model}
+fit <- lm(mpg ~ wt, data = mtcars)
+summary(fit)
+```
+
+The data has `r nrow(mtcars)` cars. Inline code like that is worked out when
+the notebook is saved as HTML.
+
+## Messages, warnings and errors
+
+With `error=TRUE`, an error doesn't stop the chunk: the lines after it still run.
+
+```{r conditions, error=TRUE}
+message("Messages appear in grey.")
+as.numeric("seven")
+stop("Errors appear in red.")
+"This line still runs."
+```
+
+## Long-running code
+
+Output shows up while a chunk runs. Press `i i`, or the stop button in the
+chunk's header, to interrupt it.
+
+```{r progress}
+for (step in 1:3) {
+  message("Step ", step, " of 3")
+  Sys.sleep(1)
+}
+```
+
+Programs that R starts print into a console box: the compiler while a package
+installs, or here, the shell.
+
+```{r shell}
+system("echo Hello from the shell")
+```
+
+## Chunks that don't run
+
+`eval=FALSE` keeps code in the file without running it, handy for one-off setup:
+
+```{r install, eval=FALSE}
+install.packages("palmerpenguins")
+```
+
+## Saving
+
+Changes save on their own. Press `s` to save now: because this file's header
+says `output: html_notebook`, that also writes `demo.nb.html` beside it, with
+the code and the outputs you see, the way RStudio does.
+
+More to try: `e` lists the objects in the R session, `b` adds a chunk below,
+`l` edits a chunk's label and options, and `d d` deletes a cell (`z` brings it
+back).

@@ -57,6 +57,9 @@ replaced the first time you run a chunk after updating.
 - The shortcut help described Tab and ↑/↓ wrongly.
 - A second `i i` while a chunk finishes no longer loses its outputs.
 - Tables with `NA` column or row names render.
+- "Run all" no longer stops at a chunk with `error=TRUE`: its errors are part
+  of its output, as in knitr and RStudio. Other errors still stop the chunks
+  queued after them.
 - `kernel.R --flag=value` no longer skips the argument after it.
 
 ### Changed
@@ -79,6 +82,8 @@ replaced the first time you run a chunk after updating.
   formats still knit.
 - `install.sh`: checks R and its packages, installs what's missing into your
   personal R library, and installs the plugin.
+- `examples/demo.Rmd`: a short tour notebook to try the plugin with, using
+  base R only.
 - `deps.R`: the package check and installer on its own.
 - `LICENSE` (MIT) and this changelog.
 
