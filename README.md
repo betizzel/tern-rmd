@@ -1,4 +1,4 @@
-# ER Notebook for Tern
+# Rmd Notebook for Tern
 
 Opens R Markdown (`.Rmd`) files in Tern as notebooks, the way Jupyter opens `.ipynb`
 files. Markdown is rendered, chunks are editable code with line numbers, and running a chunk shows its
